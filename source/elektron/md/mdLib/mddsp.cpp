@@ -39,6 +39,10 @@ namespace md
 		if(!_hw.isValid())
 			return;
 
+		// A loader DO loop polls HRDF between words. Running the entire loop in
+		// one interpreter call prevents the ColdFire from supplying the next word.
+		m_dsp.setCooperativeDoLoops(true);
+
 		// Clock the serial ports from DSP cycles. At 101.6064 MHz, the 1152-cycle
 		// codec slot and two slots per frame produce exactly 44.1 kHz; the firmware's
 		// ESSI0 divider derives the 96-cycle inter-DSP link slot.
