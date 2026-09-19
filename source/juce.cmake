@@ -1,4 +1,6 @@
 option(${CMAKE_PROJECT_NAME}_BUILD_JUCEPLUGIN "Build Juce plugins" on)
+set(GEARMULATOR_BUNDLE_ID_PREFIX "local.gearmulator.preview" CACHE STRING
+	"Bundle identifier prefix; override for personal iOS development signing")
 option(${CMAKE_PROJECT_NAME}_BUILD_FX_PLUGIN "Build FX plugin variants" off)
 
 option(${CMAKE_PROJECT_NAME}_BUILD_JUCEPLUGIN_VST2 "Build VST2 version of Juce plugins" on)
@@ -146,9 +148,33 @@ macro(createJucePlugin targetName productName isSynth plugin4CC binaryDataProjec
 		PRODUCT_NAME ${productName}                       # The name of the final executable, which can differ from the target name
 		VST3_AUTO_MANIFEST TRUE                           # While generating a moduleinfo.json is nice, Juce does not properly package using cpack on Win/Linux
 		                                                  # and completely fails on Linux if we change the suffix to .vst3, so we skip that completely for now
-		BUNDLE_ID "local.gearmulator.preview.${productNameIdentifier}"
+		BUNDLE_ID "${GEARMULATOR_BUNDLE_ID_PREFIX}.${productNameIdentifier}"
 		LV2URI "http://theusualsuspects.lv2/${productNameIdentifier}"
+		IPHONE_SCREEN_ORIENTATIONS                        # The Machinedrum/Monomachine skins are landscape (1252x648); portrait
+			UIInterfaceOrientationLandscapeLeft            # cannot fit them at a usable scale, so iPhone is locked to landscape.
+			UIInterfaceOrientationLandscapeRight
+		IPAD_SCREEN_ORIENTATIONS
+			UIInterfaceOrientationPortrait
+			UIInterfaceOrientationPortraitUpsideDown
+			UIInterfaceOrientationLandscapeLeft
+			UIInterfaceOrientationLandscapeRight
 	)
+
+	if(CMAKE_SYSTEM_NAME STREQUAL "iOS" AND TARGET ${targetName}_Standalone)
+		set_target_properties(${targetName}_Standalone PROPERTIES
+			XCODE_GENERATE_SCHEME TRUE
+			XCODE_SCHEME_LAUNCH_CONFIGURATION Release)
+	endif()
+
+	# Private local testing only. The ROM is never copied unless the caller
+	# explicitly supplies its path; release builds should use Files import.
+	if(CMAKE_SYSTEM_NAME STREQUAL "iOS" AND GEARMULATOR_IOS_ROM AND EXISTS "${GEARMULATOR_IOS_ROM}")
+		add_custom_command(TARGET ${targetName}_Standalone POST_BUILD
+			COMMAND ${CMAKE_COMMAND} -E copy_if_different
+				"${GEARMULATOR_IOS_ROM}"
+				"$<TARGET_BUNDLE_DIR:${targetName}_Standalone>/machinedrum.bin"
+			COMMENT "Copying explicitly supplied private Machinedrum ROM into local iOS test bundle")
+	endif()
 
 	# JUCE otherwise puts the internal SharedCode archive beside the final plug-in
 	# bundles in the source tree. Independent build trees (for example arm64

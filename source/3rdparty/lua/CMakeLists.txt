@@ -16,6 +16,12 @@ set_source_files_properties(${LUA_SOURCES} PROPERTIES LANGUAGE CXX)
 target_include_directories(lua PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 
 if(UNIX)
-	target_compile_definitions(lua PRIVATE LUA_USE_POSIX)
+	if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
+		# Lua's iOS configuration keeps POSIX helpers but stubs os.execute;
+		# defining only LUA_USE_POSIX makes system() unavailable at compile time.
+		target_compile_definitions(lua PRIVATE LUA_USE_IOS)
+	else()
+		target_compile_definitions(lua PRIVATE LUA_USE_POSIX)
+	endif()
 	target_link_libraries(lua PRIVATE m)
 endif()

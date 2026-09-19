@@ -41,6 +41,39 @@
       }
     },
     {
+      "name": "ios-machinedrum",
+      "displayName": "Machinedrum standalone iOS/iPadOS",
+      "generator": "Unix Makefiles",
+      "binaryDir": "${sourceDir}/build/ios-machinedrum",
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Darwin"
+      },
+      "cacheVariables": {
+        "CMAKE_SYSTEM_NAME": "iOS",
+        "CMAKE_OSX_SYSROOT": "iphoneos",
+        "CMAKE_OSX_ARCHITECTURES": "arm64",
+        "CMAKE_OSX_DEPLOYMENT_TARGET": "14.0",
+        "BUILD_TESTING": "OFF",
+        "DSP56K_FORCE_INTERPRETER": "ON",
+        "gearmulator_BUILD_JUCEPLUGIN": "ON",
+        "gearmulator_BUILD_JUCEPLUGIN_Standalone": "ON",
+        "gearmulator_BUILD_JUCEPLUGIN_VST2": "OFF",
+        "gearmulator_BUILD_JUCEPLUGIN_VST3": "OFF",
+        "gearmulator_BUILD_JUCEPLUGIN_AU": "OFF",
+        "gearmulator_BUILD_JUCEPLUGIN_CLAP": "OFF",
+        "gearmulator_BUILD_JUCEPLUGIN_LV2": "OFF",
+        "gearmulator_SYNTH_ELEKTRON": "ON",
+        "gearmulator_SYNTH_OSIRUS": "OFF",
+        "gearmulator_SYNTH_OSTIRUS": "OFF",
+        "gearmulator_SYNTH_VAVRA": "OFF",
+        "gearmulator_SYNTH_XENIA": "OFF",
+        "gearmulator_SYNTH_NODALRED2X": "OFF",
+        "gearmulator_SYNTH_JE8086": "OFF"
+      }
+    },
+    {
       "name": "zynthian",
       "inherits": "default",
       "displayName": "Build specifically for the Zynthian platform",
@@ -141,6 +174,11 @@
       "name": "macos",
       "inherits": "default",
       "configurePreset": "macos"
+    },
+    {
+      "name": "ios-machinedrum",
+      "configurePreset": "ios-machinedrum",
+      "configuration": "Release"
     },
     {
       "name": "zynthian",

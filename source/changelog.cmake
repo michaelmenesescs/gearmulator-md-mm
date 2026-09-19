@@ -18,5 +18,9 @@ add_custom_target(tus_genChangelogs
 )
 
 macro(tus_registerChangelog targetName)
-	add_dependencies(${targetName} tus_genChangelogs)
+	# Changelog generation is a desktop packaging concern. It invokes a
+	# host-side helper and must not be part of an iOS application build.
+	if(NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
+		add_dependencies(${targetName} tus_genChangelogs)
+	endif()
 endmacro()

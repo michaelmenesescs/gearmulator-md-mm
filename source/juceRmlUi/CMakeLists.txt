@@ -50,6 +50,12 @@ set(SOURCES
 	MetalContext.h
 )
 
+if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
+	# iOS exposes OpenGL ES, not the desktop fixed-function/GL3 APIs used by
+	# these diagnostic renderers. The app path uses Metal.
+	list(REMOVE_ITEM SOURCES RmlUi_Renderer_GL2.cpp RmlUi_Renderer_GL3.cpp)
+endif()
+
 if(APPLE)
 	list(APPEND SOURCES
 		RmlUi_Renderer_Metal.mm
@@ -67,7 +73,7 @@ target_link_libraries(juceRmlUi PUBLIC baseLib dsp56kBase rmlui_core rmlui_debug
 target_include_directories(juceRmlUi PUBLIC ../JUCE/modules)
 target_compile_definitions(juceRmlUi PRIVATE JUCE_GLOBAL_MODULE_SETTINGS_INCLUDED=1)
 
-if(APPLE)
+if(APPLE AND NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
 	target_compile_definitions(juceRmlUi PRIVATE JUCE_MAC=1)
 else()
 	target_compile_definitions(juceRmlUi PRIVATE JUCE_MAC=0)

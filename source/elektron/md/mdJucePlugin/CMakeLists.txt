@@ -83,9 +83,10 @@ foreach(plugin_target mdJucePlugin mmJucePlugin)
 endforeach()
 
 # JUCE can populate bundle resources after its first ad-hoc signing pass on
-# macOS. Re-sign the completed VST3 and Standalone bundles so hosts and Finder
-# do not reject their final on-disk contents.
-if(APPLE)
+# macOS. Re-sign the completed desktop bundles so hosts and Finder do not
+# reject their final on-disk contents. Never apply anonymous ad-hoc signing to
+# iOS: device builds must retain Xcode-managed development/distribution signing.
+if(APPLE AND NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
 	foreach(plugin_target
 		mdJucePlugin_VST3 mmJucePlugin_VST3
 		mdJucePlugin_AU mmJucePlugin_AU
