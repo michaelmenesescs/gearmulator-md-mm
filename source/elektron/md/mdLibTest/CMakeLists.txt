@@ -24,6 +24,12 @@ add_dependencies(mdLibTest mdRamPackingTest)
 
 set_property(TARGET mdLibTest PROPERTY FOLDER "Elektron")
 
+# Manual wall-clock probe, including a watchdog for a scheduler that never yields.
+# Firmware is supplied by the caller and is never embedded in this executable.
+add_executable(mdInterpreterBootProbe EXCLUDE_FROM_ALL interpreterBootProbe.cpp)
+target_link_libraries(mdInterpreterBootProbe PRIVATE mdLib Threads::Threads)
+set_property(TARGET mdInterpreterBootProbe PROPERTY FOLDER "Elektron/test")
+
 add_executable(mdUartRegisterTest uartRegisterTest.cpp)
 target_link_libraries(mdUartRegisterTest PRIVATE mdLib)
 add_test(NAME mdUartRegisterTest COMMAND mdUartRegisterTest)
