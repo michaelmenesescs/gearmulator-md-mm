@@ -28,11 +28,22 @@ namespace jucePluginEditorLib
 		void setEmbedded(bool _embedded);
 
 	private:
-		void setGuiScale(float _percent);
+		void setGuiScale(float _percent, bool _persist = true);
 		void setUiRoot(juce::Component* _component);
 
 		void timerCallback() override;
 		void fixParentWindowSize() const;
+
+#if JUCE_IOS
+		// On iOS the parent is the fixed, non-resizable screen and cannot be grown to fit
+		// the skin (see fixParentWindowSize). Instead we shrink the skin to fit the parent,
+		// recomputing whenever the parent's bounds change (e.g. on device rotation).
+		void parentSizeChanged() override;
+		float computeIosFitScalePercent() const;
+		void applyIosFitScale();
+
+		bool m_applyingIosFitScale = false;
+#endif
 
 		PluginEditorState& m_state;
 		juce::PropertiesFile& m_config;

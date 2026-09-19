@@ -14,8 +14,10 @@
 #include "rmlMouseInput.h"
 #include "rmlRendererJuce.h"
 
+#if !JUCE_IOS
 #include "RmlUi_Renderer_GL2.h"
 #include "RmlUi_Renderer_GL3.h"
+#endif
 
 #ifdef RMLUI_METAL_RENDERER
 #include "RmlUi_Renderer_Metal.h"
@@ -201,6 +203,9 @@ namespace juceRmlUi
 
 	void RmlComponent::newOpenGLContextCreated()
 	{
+#if JUCE_IOS
+		return;
+#else
 		RmlInterfaces::ScopedAccess access(*this);
 
 		using namespace juce::gl;
@@ -305,10 +310,14 @@ namespace juceRmlUi
 
 		dsp56k::ThreadTools::setCurrentThreadPriority(dsp56k::ThreadPriority::Lowest);
 		dsp56k::ThreadTools::setCurrentThreadName("RmlUI-Renderer");
+#endif
 	}
 
 	void RmlComponent::renderOpenGL()
 	{
+#if JUCE_IOS
+		return;
+#else
 		{
 			// although we set that we render only manually, juce still calls this function eventhough we didn't
 			// request a repaint, for example when the window is resized.
@@ -368,7 +377,11 @@ namespace juceRmlUi
 
 			const juce::Image::BitmapData data(m_screenshot, juce::Image::BitmapData::writeOnly);
 
+			#if JUCE_IOS
+			glReadPixels(0, 0, size.x, size.y, GL_RGBA, GL_UNSIGNED_BYTE, data.data);
+			#else
 			glReadPixels(0, 0, size.x, size.y, GL_BGRA, GL_UNSIGNED_BYTE, data.data);
+			#endif
 
 			// OpenGL has the origin in the lower left, juce in the upper left, so we need to flip the image vertically
 			juce::Image flipped = juce::Image(m_screenshot.getFormat(), m_screenshot.getWidth(), m_screenshot.getHeight(), false);
@@ -386,16 +399,21 @@ namespace juceRmlUi
 		}
 
 		m_renderDone = true;
+#endif
 	}
 
 	void RmlComponent::openGLContextClosing()
 	{
+#if JUCE_IOS
+		return;
+#else
 		// nothing to be done if using software renderer, this is only done to discard the GL context as we didn't like it
 		if (m_renderType == Renderer::Software)
 			return;
 
 		m_renderProxy->setRenderer(nullptr, g_renderConfigSoftware);
 		m_renderInterface.reset();
+#endif
 	}
 
 #ifdef RMLUI_METAL_RENDERER

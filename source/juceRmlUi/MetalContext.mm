@@ -4,7 +4,12 @@
 
 #import <Metal/Metal.h>
 #import <QuartzCore/QuartzCore.h>
+#import <TargetConditionals.h>
+#if TARGET_OS_IPHONE
+#import <UIKit/UIKit.h>
+#else
 #import <AppKit/AppKit.h>
+#endif
 
 #include "juce_gui_basics/juce_gui_basics.h"
 #include "juce_gui_extra/juce_gui_extra.h"
@@ -191,10 +196,21 @@ namespace juceRmlUi
 		layer.framebufferOnly = NO; // We need to read back for screenshots
 		layer.opaque = YES;
 
-		// Create an NSView backed by the Metal layer.
+		// Create a native view backed by the Metal layer.
+		#if TARGET_OS_IPHONE
+		UIView* metalView = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 100, 100)];
+		#else
 		NSView* metalView = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, 100, 100)];
+		#endif
 		if (!metalView)
 			return false;
+		#if TARGET_OS_IPHONE
+		[metalView.layer addSublayer:layer];
+		layer.frame = metalView.bounds;
+		metalView.userInteractionEnabled = NO;
+		if (auto* peer = m_component->getTopLevelComponent()->getPeer())
+			[(UIView*)peer->getNativeHandle() addSubview:metalView];
+		#else
 		metalView.wantsLayer = YES;
 		metalView.layer = layer;
 
@@ -210,6 +226,7 @@ namespace juceRmlUi
 		}
 		attachment->incReferenceCount();
 		m_viewAttachment = attachment;
+		#endif
 
 		// Keep the ownership returned by alloc. NSViewAttachment holds its own
 		// reference until destroyMetalLayer() releases the attachment.
@@ -233,16 +250,45 @@ namespace juceRmlUi
 		if (!peer)
 			return;
 
+		#if TARGET_OS_IPHONE
+		UIView* metalView = (__bridge UIView*)m_metalView;
+		const auto bounds = m_component->getBoundsInParent();
+		const auto frame = CGRectMake(bounds.getX(), bounds.getY(), bounds.getWidth(), bounds.getHeight());
+		if (!CGRectEqualToRect(metalView.frame, frame))
+			[metalView setFrame:frame];
+
+		// Unlike macOS, where the CAMetalLayer is the view's backing layer and is resized for us,
+		// here it is a manually added sublayer: UIKit never resizes it, so it would otherwise stay
+		// at the 100x100 bootstrap size and confine all rendering to a small corner of the screen.
+		CAMetalLayer* sublayer = MTL_LAYER;
+		if (!CGRectEqualToRect(sublayer.frame, metalView.bounds))
+		{
+			[CATransaction begin];
+			[CATransaction setDisableActions:YES];
+			sublayer.frame = metalView.bounds;
+			[CATransaction commit];
+		}
+		#else
 		NSView* metalView = (__bridge NSView*)m_metalView;
 		const auto area = peer->getAreaCoveredBy(*m_component);
 		const auto frame = NSMakeRect(area.getX(), area.getY(), area.getWidth(), area.getHeight());
 		if (!NSEqualRects(metalView.frame, frame))
 			[metalView setFrame:frame];
+		#endif
 
 	}
 
 	void MetalContext::destroyMetalLayer()
 	{
+		#if TARGET_OS_IPHONE
+		if (m_metalView)
+		{
+			UIView* view = (__bridge UIView*)m_metalView;
+			[view removeFromSuperview];
+			[view release];
+			m_metalView = nullptr;
+		}
+		#else
 		if (m_viewAttachment)
 		{
 			auto* attachment = static_cast<juce::ReferenceCountedObject*>(m_viewAttachment);
@@ -254,6 +300,7 @@ namespace juceRmlUi
 			[(id)m_metalView release];
 			m_metalView = nullptr;
 		}
+		#endif
 		if (m_metalLayer)
 		{
 			[(id)m_metalLayer release];
@@ -266,14 +313,19 @@ namespace juceRmlUi
 		if (!m_metalLayer || !m_metalView)
 			return;
 
+		#if TARGET_OS_IPHONE
+		UIView* metalView = (__bridge UIView*)m_metalView;
+		const auto scale = UIScreen.mainScreen.scale;
+		#else
 		NSView* metalView = (__bridge NSView*)m_metalView;
 		NSWindow* window = metalView.window;
 		if (!window)
 			return;
+		const auto scale = window.backingScaleFactor;
+		#endif
 
 		CAMetalLayer* layer = MTL_LAYER;
 
-		const auto scale = window.backingScaleFactor;
 		m_renderingScale = scale;
 		layer.contentsScale = scale;
 

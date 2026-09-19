@@ -47,20 +47,26 @@ void EditorWindow::resized()
 	const auto w = getWidth();
 	const auto h = getHeight();
 
-	const auto scaleX = static_cast<float>(w) / static_cast<float>(m_state.getWidth());
-	const auto scaleY = static_cast<float>(h) / static_cast<float>(m_state.getHeight());
-
-	const auto scale = std::min(scaleX, scaleY);
-
 	if (!m_state.resizeEditor(w,h))
 		return;
 
+#if !JUCE_IOS
+	// On iOS there is no interactive window-edge drag that bypasses setGuiScale(), so this
+	// component is only ever resized by setGuiScale() itself (which persists when asked to)
+	// or by applyIosFitScale()'s device-derived, intentionally-not-persisted fit. Persisting
+	// here unconditionally would overwrite the user's saved scale with that device-derived
+	// value every time the parent bounds change (e.g. on rotation).
 	if(m_scaleRestore.shouldPersistResize())
 	{
+		const auto scaleX = static_cast<float>(w) / static_cast<float>(m_state.getWidth());
+		const auto scaleY = static_cast<float>(h) / static_cast<float>(m_state.getHeight());
+		const auto scale = std::min(scaleX, scaleY);
+
 		const auto percent = 100.f * scale / m_state.getRootScale();
 		m_config.setValue("scale", percent);
 		m_config.saveIfNeeded();
 	}
+#endif
 
 	// Prettymuch unbelievable Juce VST3 bug, but our root component is a child of the VST3 editor component
 	// and that one is not resized! The host window is, the first child (our editor component) is, but the
@@ -115,7 +121,7 @@ void EditorWindow::setEmbedded(const bool _embedded)
 	}
 }
 
-void EditorWindow::setGuiScale(const float _percent)
+void EditorWindow::setGuiScale(const float _percent, const bool _persist/* = true*/)
 {
 	if(!m_state.getWidth() || !m_state.getHeight())
 		return;
@@ -127,8 +133,11 @@ void EditorWindow::setGuiScale(const float _percent)
 
 	setSize(w, h);
 
-	m_config.setValue("scale", _percent);
-	m_config.saveIfNeeded();
+	if(_persist)
+	{
+		m_config.setValue("scale", _percent);
+		m_config.saveIfNeeded();
+	}
 }
 
 void EditorWindow::setUiRoot(juce::Component* _component)
@@ -151,7 +160,15 @@ void EditorWindow::setUiRoot(juce::Component* _component)
 	const auto attachAction = m_scaleRestore.attachRoot(
 		juce::JUCEApplicationBase::isStandaloneApp(), configuredScale);
 	if(attachAction.applyConfiguredScale)
+	{
+#if JUCE_IOS
+		// The configured/persisted scale is meaningless on a fixed-size iOS screen;
+		// fit the skin to the actual available parent bounds instead.
+		applyIosFitScale();
+#else
 		setGuiScale(configuredScale);
+#endif
+	}
 
 	_component->setSize(getWidth(), getHeight());
 
@@ -185,7 +202,11 @@ void EditorWindow::timerCallback()
 		// A standalone host can impose its small placeholder size after the editor
 		// has loaded. Reapply the configured size once that native parent exists,
 		// and do not persist the placeholder resizes as the user's GUI scale.
+#if JUCE_IOS
+		applyIosFitScale();
+#else
 		setGuiScale(restoreScale);
+#endif
 	}
 
 	fixParentWindowSize();
@@ -201,6 +222,16 @@ void EditorWindow::fixParentWindowSize() const
 
 	while (parent)
 	{
+		auto* grandParent = parent->getParentComponent();
+
+#if JUCE_IOS
+		// The outermost component is the physical screen: it is fixed and cannot be grown,
+		// and applyIosFitScale() already shrinks the skin to fit it. Intermediate containers
+		// still must be grown, otherwise they clip the editor down to their own size.
+		if (!grandParent)
+			break;
+#endif
+
 		if (parent->getWidth() < w || parent->getHeight() < h)
 		{
 			LOG("Parent " << parent->getName() << " has wrong size: " << parent->getName() <<
@@ -209,7 +240,74 @@ void EditorWindow::fixParentWindowSize() const
 			parent->setSize(w, h);
 		}
 
-		parent = parent->getParentComponent();
+		parent = grandParent;
 	}
 }
+
+#if JUCE_IOS
+void EditorWindow::parentSizeChanged()
+{
+	AudioProcessorEditor::parentSizeChanged();
+	applyIosFitScale();
+}
+
+float EditorWindow::computeIosFitScalePercent() const
+{
+	if(!m_state.getWidth() || !m_state.getHeight())
+		return 100.0f;
+
+	// Deliberately NOT getParentComponent(): the editor is attached inside intermediate
+	// containers that have not been laid out yet and report sizes as small as 4x32, which
+	// would collapse the skin to a couple of pixels. The screen is the only reliable
+	// reference for how much room the skin actually has.
+	const auto* display = juce::Desktop::getInstance().getDisplays().getPrimaryDisplay();
+	if(!display)
+		return 100.0f;
+
+	// Keep the skin clear of notches, the status bar and the home indicator where possible.
+	const auto usable = display->safeAreaInsets.subtractedFrom(display->userArea);
+
+	const auto availableW = usable.getWidth();
+	const auto availableH = usable.getHeight();
+
+	if(availableW <= 0 || availableH <= 0)
+		return 100.0f;
+
+	const auto scaleX = static_cast<float>(availableW) / static_cast<float>(m_state.getWidth());
+	const auto scaleY = static_cast<float>(availableH) / static_cast<float>(m_state.getHeight());
+	const auto fitScale = std::min(scaleX, scaleY);
+
+	return fitScale / m_state.getRootScale() * 100.0f;
+}
+
+void EditorWindow::applyIosFitScale()
+{
+	if(!m_state.getWidth() || !m_state.getHeight())
+		return;
+
+	// setGuiScale() triggers resized(), which can re-enter through parentSizeChanged().
+	// Without this guard the scale oscillates instead of settling on a value.
+	if(m_applyingIosFitScale)
+		return;
+
+	const juce::ScopedValueSetter<bool> guard(m_applyingIosFitScale, true);
+
+	// This scale is derived from the physical screen, not chosen by the user, so it must
+	// never be written to m_config as if it were the persisted GUI scale preference.
+	const auto percent = computeIosFitScalePercent();
+	setGuiScale(percent, false);
+
+	// Intermediate containers are laid out smaller than the editor and would clip it.
+	fixParentWindowSize();
+
+
+	// setSize() keeps the top-left corner fixed, so letterboxing would otherwise all end up
+	// on the bottom/right. Only centre once the parent is actually big enough to centre in.
+	if(const auto* parent = getParentComponent())
+	{
+		if(parent->getWidth() >= getWidth() && parent->getHeight() >= getHeight())
+			setBounds(getBounds().withCentre(parent->getLocalBounds().getCentre()));
+	}
+}
+#endif
 }

@@ -410,6 +410,14 @@ namespace jucePluginEditorLib
 		if(pluginLib::Tools::isHeadless())
 			return;
 
+#if JUCE_IOS
+		// Modal message boxes currently never receive touch input on iOS, so showing this
+		// would leave the app permanently stuck on an undismissable dialog.
+		m_processor.getConfig().setValue("disclaimerSeen", true);
+		onDisclaimerFinished();
+		return;
+#endif
+
 		if(!m_processor.getConfig().getBoolValue("disclaimerSeen", false))
 		{
 			const auto& plugin4CC = m_processor.getProperties().plugin4CC;
