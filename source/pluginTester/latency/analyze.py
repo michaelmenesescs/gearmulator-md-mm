@@ -33,7 +33,9 @@ def performance(blocks, rate, notes):
     late = np.array([float(b['late_ms']) for b in warm])
     period = np.array([int(b['count']) * 1000 / rate for b in warm])
     result = dict(warm_start_seconds=12, warm_callbacks=len(warm),
+                  warm_mean_ms=float(durations.mean()),
                   warm_p50_ms=float(np.percentile(durations, 50)),
+                  warm_p95_ms=float(np.percentile(durations, 95)),
                   warm_p99_ms=float(np.percentile(durations, 99)),
                   warm_max_ms=float(durations.max()),
                   warm_over_budget=int(np.sum(durations > period)),

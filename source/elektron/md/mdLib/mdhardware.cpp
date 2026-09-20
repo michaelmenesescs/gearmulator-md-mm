@@ -1524,10 +1524,17 @@ namespace md
 		// catch-up loops are how a DSP outruns the UC by thousands of words in the first place
 		// (see the schedStep backpressure comment). MD path untouched.
 		const bool s_mmBp = isMonomachine();
-		while(d.dsp().getCycles() < targetCyc && d.dsp().getCycles() < clampStop
-			&& (!s_mmBp
-				|| d.hostTxBacklog() <= policy.hostTransmitBackpressureThresholdWords))
-			d.dsp().exec();
+		if(m_schedBoundedJit && !s_mmBp)
+		{
+			d.dsp().execUntilCycles(std::min(targetCyc, clampStop));
+		}
+		else
+		{
+			while(d.dsp().getCycles() < targetCyc && d.dsp().getCycles() < clampStop
+				&& (!s_mmBp
+					|| d.hostTxBacklog() <= policy.hostTransmitBackpressureThresholdWords))
+				d.dsp().exec();
+		}
 		MD_TRANSPORT_RECORD(const auto executed = d.dsp().getCycles() - startCyc;
 			score.executedCycles += executed;
 			score.maximumExecutedCycles = std::max(score.maximumExecutedCycles, executed);
