@@ -1593,10 +1593,25 @@ namespace md
 			score.maximumRequestedCycles = std::max(score.maximumRequestedCycles, requested););
 		m_schedInLinkDelivery = true;
 		const bool bpGate = isMonomachine();
-		while(d.dsp().getCycles() < targetCyc && d.dsp().getCycles() < clampStop
-			&& (!bpGate
-				|| d.hostTxBacklog() <= policy.hostTransmitBackpressureThresholdWords))
-			d.dsp().exec();
+		if(m_schedBoundedJit && !bpGate)
+		{
+			// Same validated bounded dispatcher used by the background scheduler slice
+			// (see schedStep()): one trampoline entry runs cached blocks back to back
+			// until cycles reach the stop point, instead of returning to this C++ loop
+			// and re-checking getCycles() after every single block. Peripheral/interrupt
+			// checks still run before every block, exactly as the old per-block loop did.
+			// Machinedrum never sets bpGate, so this is the path this catch-up always
+			// takes for MD; the per-block loop remains exact for MM's mid-catch-up
+			// backpressure check, which execUntilCycles cannot evaluate.
+			d.dsp().execUntilCycles(std::min(targetCyc, clampStop));
+		}
+		else
+		{
+			while(d.dsp().getCycles() < targetCyc && d.dsp().getCycles() < clampStop
+				&& (!bpGate
+					|| d.hostTxBacklog() <= policy.hostTransmitBackpressureThresholdWords))
+				d.dsp().exec();
+		}
 		m_schedInLinkDelivery = false;
 		MD_TRANSPORT_RECORD(const auto executed = d.dsp().getCycles() - startCyc;
 			score.executedCycles += executed;

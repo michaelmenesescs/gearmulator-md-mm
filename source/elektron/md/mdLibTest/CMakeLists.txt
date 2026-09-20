@@ -28,6 +28,21 @@ set_property(TARGET mdLibTest PROPERTY FOLDER "Elektron")
 # Firmware is supplied by the caller and is never embedded in this executable.
 add_executable(mdInterpreterBootProbe EXCLUDE_FROM_ALL interpreterBootProbe.cpp)
 target_link_libraries(mdInterpreterBootProbe PRIVATE mdLib Threads::Threads)
+
+# Diagnostic-only: measures the idle-poll fraction of DSP instruction
+# retirements (see pcHistogramProbe.cpp). Requires DSP56K_FORCE_INTERPRETER=ON
+# and -DMD_PC_HISTOGRAM_PROBE=1; inert (refuses to run) otherwise.
+add_executable(mdPcHistogramProbe EXCLUDE_FROM_ALL pcHistogramProbe.cpp)
+target_link_libraries(mdPcHistogramProbe PRIVATE mdLib)
+set_property(TARGET mdPcHistogramProbe PROPERTY FOLDER "Elektron/test")
+
+# Manual real-time-ratio benchmark: boots real firmware (JIT, Release), starts
+# playback, and sweeps block sizes measuring hardware.advance() wall-clock cost.
+# Firmware is supplied by the caller (path arg or GEARMULATOR_MD_FIRMWARE_BIN)
+# and is never embedded in this executable.
+add_executable(mdPerfBenchmark EXCLUDE_FROM_ALL mdPerfBenchmark.cpp)
+target_link_libraries(mdPerfBenchmark PRIVATE mdLib)
+set_property(TARGET mdPerfBenchmark PROPERTY FOLDER "Elektron/test")
 set_property(TARGET mdInterpreterBootProbe PROPERTY FOLDER "Elektron/test")
 
 add_executable(mdUartRegisterTest uartRegisterTest.cpp)
