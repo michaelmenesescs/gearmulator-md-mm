@@ -45,6 +45,13 @@ target_link_libraries(mdPerfBenchmark PRIVATE mdLib)
 set_property(TARGET mdPerfBenchmark PROPERTY FOLDER "Elektron/test")
 set_property(TARGET mdInterpreterBootProbe PROPERTY FOLDER "Elektron/test")
 
+# Diagnostic-only: isolates the JIT (or interpreter, matching however this binary
+# was built) wall-clock cost of a fixed-count NOP delay loop, the pattern found by
+# mdPcHistogramProbe in the Producer DSP's idle time. Needs no firmware ROM.
+add_executable(mdNopLoopMicrobench EXCLUDE_FROM_ALL nopLoopMicrobench.cpp)
+target_link_libraries(mdNopLoopMicrobench PRIVATE dsp56kEmu)
+set_property(TARGET mdNopLoopMicrobench PROPERTY FOLDER "Elektron/test")
+
 add_executable(mdUartRegisterTest uartRegisterTest.cpp)
 target_link_libraries(mdUartRegisterTest PRIVATE mdLib)
 add_test(NAME mdUartRegisterTest COMMAND mdUartRegisterTest)
