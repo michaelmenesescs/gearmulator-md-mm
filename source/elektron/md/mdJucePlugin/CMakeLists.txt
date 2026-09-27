@@ -29,6 +29,8 @@ set(SOURCES
 	mdPluginProcessor.cpp mdPluginProcessor.h
 	mdRemotePanel.cpp mdRemotePanel.h
 	mdRemotePanelV3.cpp
+	mdRemotePanelPng.cpp mdRemotePanelPng.h
+	mdRemotePanelCapturePolicy.h
 	mdRemotePanelProtocol.h
 	mdRemotePanelServer.cpp mdRemotePanelServer.h
 	mdStorageImage.cpp mdStorageImage.h
@@ -224,6 +226,13 @@ if(BUILD_TESTING)
 	set_tests_properties(mdStandaloneRendererPolicyTest PROPERTIES
 		LABELS "UnitTest;Rendering")
 	set_property(TARGET mdStandaloneRendererPolicyTest PROPERTY FOLDER "Elektron/test")
+
+	add_executable(mdRemotePanelPngTest mdRemotePanelPngTest.cpp mdRemotePanelPng.cpp)
+	target_link_libraries(mdRemotePanelPngTest PRIVATE juce_plugin_modules)
+	target_compile_definitions(mdRemotePanelPngTest PRIVATE JUCE_GLOBAL_MODULE_SETTINGS_INCLUDED=1)
+	add_test(NAME mdRemotePanelPngTest COMMAND mdRemotePanelPngTest)
+	set_tests_properties(mdRemotePanelPngTest PROPERTIES LABELS "UnitTest")
+	set_property(TARGET mdRemotePanelPngTest PROPERTY FOLDER "Elektron/test")
 
 	add_executable(mdPanelRenderingTest mdPanelRenderingTest.cpp mdPixelPerfectPanel.cpp)
 	target_link_libraries(mdPanelRenderingTest PRIVATE juceRmlUi juceUiLib juce_plugin_modules juce::juce_opengl)

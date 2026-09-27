@@ -120,7 +120,7 @@ Encoder movement follows the real knob's configured range and speed:
 Accumulate fractional deltas per driving contact; truncate toward zero to whole detents.
 Only the first contact on one knob drives motion; additional contacts hold passively and
 are not promoted to drivers when it lifts. Independent knobs have independent accumulators.
-A stationary hold presses after 400 ms, serviced at 20 ms opportunities. Moving more than
+A stationary hold presses after 400 ms, serviced at 5–20 ms timer opportunities. Moving more than
 10 **context units of Manhattan distance** before that disables the pending hold. A held
 encoder may subsequently turn while pressed. A quick tap does not press. Passive contacts
 share the group's hold decision and keep its press owned until their releases. An unsupported
@@ -234,16 +234,21 @@ offset 0 u8 15 hex, 1 u32 generation, 5 u64 capture sequence. The sequence must 
 no newer than a fully sent frame for this session and generation. Acknowledge each displayed
 keyframe; only the first is needed to unlock interaction in that generation.
 
-Capture opportunities are at most about 15/s (67 ms minimum, on a 20 ms timer, so actual
-opportunities can be lower). `captureRequested`, `captureAccepted`, `captureCompleted` are
-separate cumulative counters. The callback only bounds/checks/copies pixels into one newest
-pending capture. PNG compression runs on a dedicated worker, separate from input ingress and
-encoder remainder draining. Equal encoded pixels suppress transmission, though capture and
-compression still cost CPU while idle. These are not measured frame-rate or CPU promises.
+Capture cadence is adaptive (see `remote-panel-v3-latency.md`). Idle: one capture per 200 ms
+on a 20 ms timer. Fast (a Touch is down, a Touch was just handled, LCD/LED contents changed, or
+the last capture's pixels differed; held for 600 ms after the last such signal): at most one
+per 33 ms on a 5 ms timer, additionally paced so that a capture is only requested once the
+per-client budget below could send the previous keyframe whole. `captureRequested`,
+`captureAccepted`, `captureCompleted` are separate cumulative counters. The callback only
+bounds/checks/copies pixels into one newest pending capture and wakes the worker. PNG
+compression runs on that dedicated worker, separate from input ingress and encoder remainder
+draining. A capture whose pixels equal the live keyframe's is neither encoded nor sent. The
+PNG is ordinary and lossless (RGB8 when every pixel is opaque, else RGBA8; Up-filtered rows,
+zlib level 3); any PNG decoder applies. These are not measured frame-rate or CPU promises.
 
 Each client retains one in-progress immutable PNG plus access to the global newest PNG;
 intermediate frames coalesce. A token bucket limits PanelChunk payloads to 1,250,000 B/s
-with at most 32,768 B burst credit, initially 16,384 B. One ≤16,425 B message is sent between
+with at most 131,072 B burst credit (one whole keyframe), initially 16,384 B. One ≤16,425 B message is sent between
 control-queue drains. Control traffic, source messages, WebSocket/TCP headers and legacy LCD
 frames are outside this budget. A two-second socket send timeout bounds a stalled write;
 chunks still cannot preempt bytes already in TCP, so zero ack latency is **not** promised.

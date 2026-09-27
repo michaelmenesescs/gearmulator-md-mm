@@ -1,4 +1,5 @@
 #include "mdRemotePanel.h"
+#include "mdRemotePanelPng.h"
 #include "mdEditor.h"
 #include "juceRmlUi/juceRmlComponent.h"
 #include "juceRmlUi/rmlInterfaces.h"
@@ -25,7 +26,7 @@ void RemotePanel::attachEditor(Editor* editor) {
  jassert(juce::MessageManager::getInstance()->isThisTheMessageThread());
  if(m_editor) detachEditor(m_editor);
  m_editor=editor;
- startTimer(20);
+ startTimer(CapturePolicy::g_idleTimerMs);
 }
 void RemotePanel::detachEditor(Editor* editor) {
  if(m_editor!=editor) return;
@@ -109,9 +110,24 @@ void RemotePanel::timerCallback() {
   }
   updateContactVisual(c.element.get());
  }
+ m_capturePolicy.setTouchActive(!m_contacts.empty());
  }
- if(now-m_lastCaptureRequestUs<66667 || m_panelClients.load()==0) return;
- m_lastCaptureRequestUs=now;
+ // Adaptive cadence: cheap change signals switch to fast captures before any pixels are read.
+ // The display sequence only advances when LCD or LED contents actually differ (pump poll);
+ // the editor's LED publication sequence counts bank writes, so it is not used as activity.
+ const auto display=m_displaySequence.load(), pixels=m_pixelChanges.load();
+ if(display!=m_seenDisplaySequence || pixels!=m_seenPixelChanges) {
+  m_seenDisplaySequence=display; m_seenPixelChanges=pixels;
+  m_capturePolicy.activity(now);
+ }
+ if(const auto published=m_publishedBytes.load(); published!=m_seenPublishedBytes) {
+  m_capturePolicy.keyframePublished(now,size_t(published-m_seenPublishedBytes),size_t(m_lastPublishedBytes.load()));
+  m_seenPublishedBytes=published;
+ }
+ const bool viewers=m_panelClients.load()!=0;
+ const auto timerMs=viewers ? m_capturePolicy.timerMs(now) : CapturePolicy::g_idleTimerMs;
+ if(getTimerInterval()!=timerMs) startTimer(timerMs);
+ if(!viewers || !m_capturePolicy.due(now)) return;
  ++m_captureRequested;
  const auto generation=m_geometryGeneration.load();
  const auto led=m_editor->m_remoteLedSequence;
@@ -123,10 +139,13 @@ void RemotePanel::timerCallback() {
    || image.getWidth()!=int(geometry.contextWidth) || image.getHeight()!=int(geometry.contextHeight)) return;
   Capture c; c.image=image.createCopy(); c.geometry=geometry; c.generation=generation;
   c.sequence=++m_captureCompleted; c.completedUs=clockUs(); c.ledSequence=led;
-  std::lock_guard lock(m_panelMutex);
-  if(generation!=m_geometryGeneration) return;
-  m_lastCaptureUs=c.completedUs;
-  m_pendingCapture=std::move(c);
+  {
+   std::lock_guard lock(m_panelMutex);
+   if(generation!=m_geometryGeneration) return;
+   m_lastCaptureUs=c.completedUs;
+   m_pendingCapture=std::move(c);
+  }
+  m_captureCv.notify_one();
  })) ++m_captureAccepted;
 }
 void RemotePanel::servicePanelCapture() {
@@ -135,11 +154,12 @@ void RemotePanel::servicePanelCapture() {
  if(c.image.isNull()) return;
  // Only the existing composed image is scaled. No re-rendering of skin or LCD.
  if(c.image.getWidth()>1100) c.image=c.image.rescaled(1100,std::max(1,c.image.getHeight()*1100/c.image.getWidth()),juce::Graphics::mediumResamplingQuality);
- juce::MemoryOutputStream out;
- if(!juce::PNGImageFormat().writeImageToStream(c.image,out) || out.getDataSize()>2*1024*1024) { sourceUnavailable(5); return; }
+ // Unchanged pixels of a live keyframe are neither encoded nor sent (~0.1 ms instead of an encode).
+ bool live=false;
+ { std::lock_guard lock(m_panelMutex); live=m_sourceAvailable && m_panelImage && m_panelImage->generation==c.generation; }
+ if(live && samePixels(c.image,m_lastImage)) return;
  auto frame=std::make_shared<PanelImage>();
- const auto* bytes=static_cast<const uint8_t*>(out.getData());
- frame->png.assign(bytes,bytes+out.getDataSize());
+ if(!encodePanelPng(c.image,frame->png,{3}) || frame->png.size()>2*1024*1024) { sourceUnavailable(5); return; }
  frame->generation=c.generation; frame->sequence=c.sequence; frame->completedUs=c.completedUs; frame->ledSequence=c.ledSequence;
  frame->width=c.image.getWidth(); frame->height=c.image.getHeight();
  auto& s=frame->source; s={uint8_t(Msg::PanelSource),1,0}; u32(s,c.generation);
@@ -150,10 +170,12 @@ void RemotePanel::servicePanelCapture() {
   std::lock_guard lock(m_panelMutex);
   if(c.generation!=m_geometryGeneration || clockUs()-c.completedUs>750000) return;
   restored=!m_sourceAvailable;
-  if(!restored && frame->png==m_lastPng) return;
-  m_lastPng=frame->png;
   m_panelImage=frame; m_sourceReason=0; m_sourceAvailable=true;
  }
+ m_lastImage=c.image;
+ m_lastPublishedBytes=frame->png.size();
+ m_publishedBytes+=frame->png.size();
+ if(!restored) ++m_pixelChanges;
  if(restored) log("source available generation="+std::to_string(c.generation)+" raster="+std::to_string(frame->width)+"x"+std::to_string(frame->height));
  m_server.notifyFrame();
 }
@@ -314,6 +336,11 @@ void RemotePanel::handleAsyncUpdate() {
   std::vector<uint8_t> ack{uint8_t(Msg::TouchAck)}; u32(ack,e.sequence); ack.push_back(uint8_t(status)); ack.push_back(uint8_t(slot));
   u32(ack,m_geometryGeneration); u64(ack,e.receivedUs); u64(ack,resolved); u64(ack,enqueued); u32(ack,owners); u32(ack,uint32_t(detents));
   m_server.send(e.client,std::move(ack));
+ }
+ // Touch input is capture-cadence activity: go fast now rather than at the next idle tick.
+ if(!events.empty() && m_editor && m_panelClients.load()) {
+  m_capturePolicy.activity(clockUs());
+  if(getTimerInterval()!=CapturePolicy::g_fastTimerMs) startTimer(CapturePolicy::g_fastTimerMs);
  }
 }
 }

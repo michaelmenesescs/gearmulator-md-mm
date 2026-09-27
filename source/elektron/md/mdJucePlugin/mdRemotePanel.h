@@ -9,6 +9,7 @@
 #include <string>
 #include <thread>
 #include <vector>
+#include <condition_variable>
 #include <deque>
 #include "juce_gui_basics/juce_gui_basics.h"
 #include "RmlUi/Core/ObserverPtr.h"
@@ -17,6 +18,7 @@ namespace Rml { class Element; }
 #include "mdRemotePanelProtocol.h"
 #include "mdRemotePanelOwnership.h"
 #include "mdRemotePanelServer.h"
+#include "mdRemotePanelCapturePolicy.h"
 
 #include "mdLib/mdtypes.h"
 
@@ -209,10 +211,15 @@ namespace mdJucePlugin
 		std::atomic<bool> m_sourceAvailable{false};
 		std::atomic<uint64_t> m_lastCaptureUs{0};
 		std::atomic<uint8_t> m_sourceReason{1};
-		uint64_t m_lastCaptureRequestUs=0;
+		remotePanel::CapturePolicy m_capturePolicy; // message thread only
+		uint64_t m_seenDisplaySequence=0, m_seenPixelChanges=0, m_seenPublishedBytes=0; // message thread only
+		std::atomic<uint64_t> m_publishedBytes{0}, m_lastPublishedBytes{0};	// worker: keyframes handed to the writers
+		std::atomic<uint64_t> m_displaySequence{0};	// pump: LCD/LED contents changed
+		std::atomic<uint64_t> m_pixelChanges{0};		// worker: published pixels differed
+		std::condition_variable m_captureCv;			// wakes the worker when a capture is pending
 		std::atomic<uint64_t> m_captureRequested{0},m_captureAccepted{0},m_captureCompleted{0};
 		std::atomic<uint64_t> m_panelBytes{0},m_panelFrames{0},m_touchReceived{0};
-		std::vector<uint8_t> m_lastPng; // worker only
+		juce::Image m_lastImage; // worker only: pixels of the published keyframe
 
 		// Counters.
 		std::atomic<uint64_t> m_inputs{0};

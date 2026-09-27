@@ -1,0 +1,43 @@
+PASS synthetic-1032x535: panel writer encodes
+PASS synthetic-1032x535: juce decodes panel PNG
+PASS synthetic-1032x535: decoded pixels identical to juce::PNGImageFormat round trip
+PASS synthetic translucent (RGBA fallback): panel writer encodes
+PASS synthetic translucent (RGBA fallback): juce decodes panel PNG
+PASS synthetic translucent (RGBA fallback): decoded pixels identical to juce::PNGImageFormat round trip
+PASS synthetic RGB-format image: panel writer encodes
+PASS synthetic RGB-format image: juce decodes panel PNG
+PASS synthetic RGB-format image: decoded pixels identical to juce::PNGImageFormat round trip
+PASS dedup: identical copy compares equal
+PASS dedup: one changed pixel (last pixel) compares different
+PASS dedup: one changed pixel (first pixel) compares different
+PASS dedup: different size compares different
+PASS policy: idle 30 s -> 150 captures, never fast
+PASS policy: activity switches to fast
+PASS policy: first tick after activity captures immediately
+PASS policy: changing panel -> 29 captures in 1 s (fast)
+PASS policy: decays to idle 600 ms after last activity
+PASS policy: touch active keeps fast cadence
+PASS policy: touch released and no activity -> idle
+PASS policy: budget-paced sustained change -> 155 captures in 10 s (budget allows 153), max gap 65 ms
+PASS policy: idle interval + timer slack < 750 ms freshness deadline
+PASS idle 30 s: 150 captures, 0 encodes, 0 PanelChunk bytes
+
+BENCH synthetic-1032x535  1032x535, 60 iterations, ms median / p95 / mean
+  callback createCopy                   0.217 /   0.462 /   0.257
+  BEFORE juce::PNGImageFormat (lvl 6)   42.389 /  70.285 /  46.685   117391 bytes
+  AFTER  panel PNG zlib 3, Up (shipped)   8.025 /   9.023 /   8.051   111287 bytes
+  (alt)  panel PNG zlib 1, Up filter     6.624 /   7.680 /   6.871   126917 bytes
+  AFTER  unchanged-frame pixel compare   0.089 /   0.091 /   0.089   0 bytes (encode skipped)
+  worker cost per CHANGED capture: before 42.389 ms, after 8.114 ms (compare + encode)
+  worker cost per UNCHANGED capture: before 42.389 ms, after 0.089 ms
+  PanelBudget transfer of one keyframe from quiet link (current burst cap 131072 B): 0.0 ms (126917 B, zlib 1), 0.0 ms (111287 B, zlib 3)
+
+MODEL host-side change -> last PanelChunk byte released (ms median / p95 / mean)
+  excludes render/readback, Wi-Fi, iPad decode; uses encode medians measured above
+  single touch (pressed state)  before  152.1 /  188.8 /  152.7   after   13.1 /   33.1 /   15.6
+    of which change -> capture request      before   39.3 /   76.1 /   39.8   after    5.0 /   25.0 /    7.5
+  single firmware LED/LCD       before  152.1 /  188.8 /  152.7   after   19.4 /   33.3 /   19.7
+    of which change -> capture request      before   39.3 /   76.1 /   39.8   after   11.3 /   25.2 /   11.6
+  sustained change: before 10.6 keyframes/s, age  179.4 /  214.8 /  179.0;  after 11.2 keyframes/s, age    8.8 /    9.6 /    9.0
+
+ALL PASSED: 0 failure(s)

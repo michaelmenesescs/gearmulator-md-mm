@@ -38,7 +38,7 @@ int main() {
  for(uint64_t us=1000;us<=1001000;us+=1000) if(budget.consume(us,16425)) sent+=16425;
  CHECK(sent<=1250000+16384 && sent>1200000);
  CHECK(!budget.consume(1001000,2*1024*1024));
- budget.consume(2000000,0); CHECK(budget.tokens<=32768);
+ budget.consume(2000000,0); CHECK(budget.tokens<=131072 && budget.tokens>=90000);
  std::cout << "PASS Touch: LE layout, phases, short/oversize, NaN/Inf, coordinate bounds (-ffast-math)\n";
- std::cout << "PASS PanelBudget: simulated 1 s bytes=" << sent << " burst<=32768, rejects 2 MiB\n";
+ std::cout << "PASS PanelBudget: simulated 1 s bytes=" << sent << " burst<=131072 (one whole keyframe), rejects 2 MiB\n";
 }

@@ -26,11 +26,16 @@ inline TouchData decodeTouch(const uint8_t* p,size_t n) {
  t.phase=p[1]; t.contact=uint16_t(p[2]) | uint16_t(p[3])<<8; t.generation=readU32(p+8);
  return t;
 }
+// Per-client PanelChunk token bucket. The sustained rate (1.25 B/us) is unchanged from the
+// first v3 release; the burst cap holds one whole keyframe (~80 kB) so the first frame after
+// a quiet period leaves immediately instead of trickling out over ~40 ms.
+constexpr double g_panelBudgetBytesPerUs=1.25;
+constexpr double g_panelBudgetBurst=131072;
 struct PanelBudget {
  uint64_t lastUs=0;
  double tokens=16384;
  bool consume(uint64_t now,size_t bytes) {
-  if(lastUs && now>=lastUs) tokens=std::min(32768.0,tokens+(now-lastUs)*1.25);
+  if(lastUs && now>=lastUs) tokens=std::min(g_panelBudgetBurst,tokens+(now-lastUs)*g_panelBudgetBytesPerUs);
   lastUs=now;
   if(tokens<bytes) return false;
   tokens-=bytes; return true;

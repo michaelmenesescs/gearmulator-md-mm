@@ -94,7 +94,10 @@ namespace mdJucePlugin
 		m_captureWorker = std::thread([this] {
 			while(m_running) {
 				servicePanelCapture();
-				std::this_thread::sleep_for(std::chrono::milliseconds(5));
+				// Woken by the screenshot callback; the timeout only bounds shutdown.
+				std::unique_lock lock(m_panelMutex);
+				m_captureCv.wait_for(lock, std::chrono::milliseconds(20),
+					[this] { return !m_running || !m_pendingCapture.image.isNull(); });
 			}
 		});
 		log(std::string("listening on port ") + std::to_string(m_server.port()) + " model "
@@ -107,6 +110,7 @@ namespace mdJucePlugin
 		cancelPendingUpdate();
 		m_captureLifetime.reset();
 		m_running = false;
+		m_captureCv.notify_all();
 		if(m_pump.joinable())
 			m_pump.join();
 		if(m_captureWorker.joinable()) m_captureWorker.join();
@@ -457,6 +461,7 @@ namespace mdJucePlugin
 		next.inputEpoch = epoch;
 		m_snapshot = next;
 		++m_displayChanges;
+		++m_displaySequence;
 		return true;
 	}
 

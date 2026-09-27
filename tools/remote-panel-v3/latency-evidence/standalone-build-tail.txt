@@ -1,0 +1,5 @@
+ld: warning: reducing alignment of section __DATA,__common from 0x8000 to 0x4000 because it exceeds segment maximum alignment
+Ad-hoc signing completed mdJucePlugin_Standalone bundle
+/Users/michaelmeneses/gearmulator-md-mm/build/macos-md-arm64/products/Release/Standalone/Gearmulator MD.app: replacing existing signature
+[100%] Built target mdJucePlugin_Standalone
+taskpolicy -b nice -n 20 cmake --build build/macos-md-arm64 --target  -j 8  83.80s user 27.27s system 159% cpu 1:09.72 total
