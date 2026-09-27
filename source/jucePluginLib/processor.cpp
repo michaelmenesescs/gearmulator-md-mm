@@ -16,6 +16,7 @@
 
 #include "client/remoteDevice.h"
 
+#include "synthLib/callbackCapture.h"
 #include "synthLib/deviceException.h"
 #include "synthLib/os.h"
 #include "synthLib/midiBufferParser.h"
@@ -666,6 +667,8 @@ namespace pluginLib
 	//==============================================================================
 	void Processor::prepareToPlay(double sampleRate, int samplesPerBlock)
 	{
+		if(synthLib::callbackCapture::isEnabled())
+			synthLib::callbackCapture::logInfo(("prepareToPlay sampleRate=" + std::to_string(sampleRate) + " samplesPerBlock=" + std::to_string(samplesPerBlock)).c_str());
 		// Use this method as the place to do any pre-playback
 		// initialisation that you need
 		m_hostSamplerate = static_cast<float>(sampleRate);
@@ -775,7 +778,9 @@ namespace pluginLib
 	void Processor::processBlock(juce::AudioBuffer<float>& buffer, juce::MidiBuffer& midiMessages)
 	{
 	    juce::ScopedNoDenormals noDenormals;
+		const auto callbackStart = std::chrono::steady_clock::now();
 	    const int numSamples = buffer.getNumSamples();
+		synthLib::callbackCapture::Scope fullCapture(static_cast<size_t>(numSamples), getSampleRate());
 		synthLib::RealtimeInstrumentation::CallbackScope instrumentation(
 			getPlugin().getRealtimeInstrumentation(), static_cast<size_t>(numSamples),
 			getSampleRate());
@@ -900,6 +905,7 @@ namespace pluginLib
 		getPlugin().process(inputs, outputs, numSamples, bpm, ppqPos, isPlaying, ppqKnown);
 
 		applyOutputGain(outputs, numSamples);
+		onAudioRendered(outputs, static_cast<size_t>(numSamples), callbackStart);
 
 		m_midiOut.clear();
 		getPlugin().getMidiOut(m_midiOut);

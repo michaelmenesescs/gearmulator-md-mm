@@ -5,6 +5,7 @@
 #include "juceRmlDrag.h"
 #include "rmlInterfaces.h"
 #include "rmlRendererProxy.h"
+#include "rmlTouchRouter.h"
 #include "baseLib/event.h"
 
 #include "juce_gui_basics/juce_gui_basics.h"
@@ -149,6 +150,10 @@ namespace juceRmlUi
 		void paint(juce::Graphics& _g) override;
 
 		Component* getComponentAt(juce::Point<float> _position) override;
+
+		const TouchRouter& getTouchRouter() const { return m_touchRouter; }
+		// Releases every finger currently held on the panel, e.g. when the view goes away.
+		void cancelTouches();
 		Rml::Element* getLastElementByGetComponentAt() const { return m_lastGetComponentAt.get(); }
 
 	private:
@@ -166,6 +171,8 @@ namespace juceRmlUi
 #endif
 
 		Rml::Vector2i getRenderSize() const;
+
+		static bool isTouch(const juce::MouseEvent& _event);
 
 		int toRmlModifiers(const juce::MouseEvent& _event);
 		int toRmlModifiers(const juce::KeyPress& _event);
@@ -190,6 +197,8 @@ namespace juceRmlUi
 
 		Rml::Context* m_rmlContext = nullptr;
 		Rml::ElementDocument* m_document = nullptr;
+
+		TouchRouter m_touchRouter;
 
 		std::vector<juce::KeyPress> m_pressedKeys;
 		float m_contentScale = 1.0f;

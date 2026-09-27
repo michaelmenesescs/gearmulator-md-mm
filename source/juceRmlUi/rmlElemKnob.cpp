@@ -1,6 +1,7 @@
 #include "rmlElemKnob.h"
 
 #include "rmlHelper.h"
+#include "rmlTouchRouter.h"
 
 #include <cmath>
 
@@ -8,6 +9,9 @@ namespace juceRmlUi
 {
 	ElemKnob::ElemKnob(Rml::CoreInstance& _coreInstance, const Rml::String& _tag): ElemValue(_coreInstance, _tag)
 	{
+		// Each finger turns its own knob; see TouchRouter.
+		TouchRouter::setTouchCapture(this);
+
 		AddEventListener(Rml::EventId::Mousedown, this);
 		AddEventListener(Rml::EventId::Drag, this);
 		AddEventListener(Rml::EventId::Mousescroll, this);

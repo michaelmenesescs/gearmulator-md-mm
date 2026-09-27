@@ -1,4 +1,8 @@
 option(${CMAKE_PROJECT_NAME}_BUILD_JUCEPLUGIN "Build Juce plugins" on)
+set(GEARMULATOR_BUNDLE_ID_PREFIX "local.gearmulator.preview" CACHE STRING
+	"Bundle identifier prefix; override for personal iOS development signing")
+set(GEARMULATOR_IOS_DISPLAY_NAME_SUFFIX "" CACHE STRING
+	"iOS only: appended to the home-screen name, e.g. to tell a JIT test variant apart")
 option(${CMAKE_PROJECT_NAME}_BUILD_FX_PLUGIN "Build FX plugin variants" off)
 
 option(${CMAKE_PROJECT_NAME}_BUILD_JUCEPLUGIN_VST2 "Build VST2 version of Juce plugins" on)
@@ -124,7 +128,12 @@ endmacro()
 
 macro(createJucePlugin targetName productName isSynth plugin4CC binaryDataProject synthLibProject)
 	string(REPLACE " " "" productNameIdentifier "${productName}")
+	set(iosPlistToMerge)
+	if(CMAKE_SYSTEM_NAME STREQUAL "iOS" AND GEARMULATOR_IOS_DISPLAY_NAME_SUFFIX)
+		set(iosPlistToMerge PLIST_TO_MERGE "<plist><dict><key>CFBundleDisplayName</key><string>${productName}${GEARMULATOR_IOS_DISPLAY_NAME_SUFFIX}</string></dict></plist>")
+	endif()
 	juce_add_plugin(${targetName}
+		${iosPlistToMerge}
 		# VERSION ...                                     # Set this if the plugin version is different to the project version
 		# ICON_BIG ...                                    # ICON_* arguments specify a path to an image file to use as an icon for the Standalone
 		# ICON_SMALL ...
@@ -148,7 +157,32 @@ macro(createJucePlugin targetName productName isSynth plugin4CC binaryDataProjec
 		                                                  # and completely fails on Linux if we change the suffix to .vst3, so we skip that completely for now
 		BUNDLE_ID "local.gearmulator.preview.${productNameIdentifier}"
 		LV2URI "http://theusualsuspects.lv2/${productNameIdentifier}"
+		IPHONE_SCREEN_ORIENTATIONS                        # The Machinedrum/Monomachine skins are landscape (1252x648); portrait
+			UIInterfaceOrientationLandscapeLeft            # cannot fit them at a usable scale, so iPhone is locked to landscape.
+			UIInterfaceOrientationLandscapeRight
+		IPAD_SCREEN_ORIENTATIONS                          # iPad too: portrait would shrink the panel to ~65% of the landscape fit
+			UIInterfaceOrientationLandscapeLeft
+			UIInterfaceOrientationLandscapeRight
+		REQUIRES_FULL_SCREEN TRUE                         # iPad: landscape-only needs opting out of Split View/Slide Over
 	)
+
+	if(CMAKE_SYSTEM_NAME STREQUAL "iOS" AND TARGET ${targetName}_Standalone)
+		set_target_properties(${targetName}_Standalone PROPERTIES
+			XCODE_GENERATE_SCHEME TRUE
+			XCODE_SCHEME_LAUNCH_CONFIGURATION Release)
+	endif()
+
+	# Private local testing only. The ROM is never copied unless the caller
+	# explicitly supplies its path; release builds should use Files import.
+	# The caller selects the ROM per target by setting iosRomFile/iosRomName
+	# before invoking this macro, so each product only ever embeds its own ROM.
+	if(CMAKE_SYSTEM_NAME STREQUAL "iOS" AND iosRomFile AND EXISTS "${iosRomFile}")
+		add_custom_command(TARGET ${targetName}_Standalone POST_BUILD
+			COMMAND ${CMAKE_COMMAND} -E copy_if_different
+				"${iosRomFile}"
+				"$<TARGET_BUNDLE_DIR:${targetName}_Standalone>/${iosRomName}"
+			COMMENT "Copying explicitly supplied private ROM into local iOS test bundle as ${iosRomName}")
+	endif()
 
 	# JUCE otherwise puts the internal SharedCode archive beside the final plug-in
 	# bundles in the source tree. Independent build trees (for example arm64

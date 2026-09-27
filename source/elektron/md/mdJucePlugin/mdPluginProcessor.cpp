@@ -2,6 +2,7 @@
 
 #include "mdController.h"
 #include "mdPluginEditorState.h"
+#include "mdRemotePanel.h"
 #include "mdStorageImage.h"
 
 // ReSharper disable once CppUnusedIncludeDirective
@@ -20,6 +21,7 @@
 #include "juce_audio_utils/juce_audio_utils.h"
 #include "juce_audio_plugin_client/Standalone/juce_StandaloneFilterWindow.h"
 
+#include <cstdlib>
 #include <memory>
 #include <utility>
 
@@ -423,6 +425,39 @@ namespace mdJucePlugin
 		// The environment switch is also useful in hosts without an open editor.
 		if(getPlugin().getRealtimeInstrumentation().isEnabled())
 			setPerformanceDiagnosticsEnabled(true);
+
+		// LAN touch panel for the iPad. Only real (non-test) instances listen.
+		const auto* const remoteEnv = std::getenv("GM_REMOTE_PANEL");
+		const bool remoteWanted = !(remoteEnv && std::string(remoteEnv) == "0")
+			&& getConfig().getBoolValue("remotePanelEnabled", true);
+		if(_allowMcpServer && !_ephemeralConfig && remoteWanted)
+		{
+			RemotePanel::Config config;
+			const bool isMonomachine = m_model == md::MachineModel::Monomachine;
+			config.port = static_cast<uint16_t>(getConfig().getIntValue("remotePanelPort",
+				isMonomachine ? 7800 : 7788));
+			const auto* const webEnv = std::getenv("GM_REMOTE_PANEL_WEB");
+			const auto defaultWeb = juce::File::getSpecialLocation(juce::File::userHomeDirectory)
+				.getChildFile("gearmulator-ipad-panel").getChildFile("web").getFullPathName();
+			config.webRoot = webEnv ? std::string(webEnv)
+				: getConfig().getValue("remotePanelWebRoot", defaultWeb).toStdString();
+			const auto logFolder = performanceDiagnosticsFolder();
+			if(logFolder.createDirectory().wasOk())
+				config.logFile = logFolder.getChildFile(isMonomachine
+					? "remote-panel-MM.log" : "remote-panel-MD.log").getFullPathName().toStdString();
+			m_remotePanel = std::make_unique<RemotePanel>(getPlugin(), m_model, std::move(config));
+			if(!m_remotePanel->isRunning())
+				m_remotePanel.reset();
+		}
+	}
+
+	void AudioPluginAudioProcessor::onAudioRendered(const synthLib::TAudioOutputs& _outputs,
+		const size_t _numSamples, const std::chrono::steady_clock::time_point _callbackStart)
+	{
+		if(m_remotePanel)
+			m_remotePanel->processAudio(_outputs[0], _outputs[1], static_cast<int>(_numSamples),
+				getSampleRate(), static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+					_callbackStart.time_since_epoch()).count()));
 	}
 
 	juce::AudioProcessor::BusesProperties AudioPluginAudioProcessor::createBusesProperties()
@@ -440,6 +475,8 @@ namespace mdJucePlugin
 
 	AudioPluginAudioProcessor::~AudioPluginAudioProcessor()
 	{
+		// Releases every remote hold while the device still exists.
+		m_remotePanel.reset();
 		stopTimer();
 		m_performanceReport.reset();
 		destroyEditorState();

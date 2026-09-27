@@ -90,6 +90,8 @@ namespace mdJucePlugin
 
 	private:
 		friend struct EditorIdentityTestAccess;
+		friend class RemotePanel;
+		uint64_t m_remoteLedSequence = 0;
 
 		void timerCallback(int _timerId) override;
 
@@ -118,6 +120,10 @@ namespace mdJucePlugin
 		void endPanelGesture();
 		void releasePanelButtonGestures();
 		void releaseEncoderPress();
+		void beginEncoderPress(juceRmlUi::ElemKnob* _knob, const std::optional<md::PanelPacket>& _packet,
+			bool _left, bool _alt, int _touch);
+		void serviceTouchEncoderHold(double _nowMilliseconds);
+		bool isTouchHeld(int _touch) const;
 		void cancelPanelInputGestures();
 		void releaseAllPanelInputs();
 		void globalFocusChanged(juce::Component* _focusedComponent) override;
@@ -194,6 +200,23 @@ namespace mdJucePlugin
 		panelAffordances::ShiftPanelLatch m_shiftPanelLatch;
 		panelAffordances::EncoderPressGesture m_encoderPress;
 		juceRmlUi::ElemKnob* m_pressedEncoder = nullptr;
+
+		// Finger that owns the encoder press / LCD drag, or -1 for the mouse. Other
+		// fingers lifting must not end them (see juceRmlUi::TouchRouter).
+		int m_encoderPressTouch = -1;
+		int m_lcdGestureTouch = -1;
+
+		// Fingers have no Alt key: an encoder held still for a moment is pressed.
+		struct TouchEncoderHold
+		{
+			juceRmlUi::ElemKnob* knob = nullptr;
+			std::optional<md::PanelPacket> packet;
+			int touch = -1;
+			float x = 0.0f;
+			float y = 0.0f;
+			double startMilliseconds = 0.0;
+		};
+		std::optional<TouchEncoderHold> m_touchEncoderHold;
 
 		struct ActivePanelButton
 		{

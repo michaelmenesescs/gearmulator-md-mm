@@ -27,6 +27,7 @@ set(SOURCES
 	os.cpp os.h
 	plugin.cpp plugin.h
 	realtimeInstrumentation.cpp realtimeInstrumentation.h
+	callbackCapture.cpp callbackCapture.h
 	performanceReport.cpp performanceReport.h
 	mameResamplers.cpp mameResamplers.h
 	resampler.cpp resampler.h

@@ -20,6 +20,7 @@ namespace juceRmlUi
 		void ProcessEvent(Rml::Event& _event) override;
 
 		void setEndless(bool _endless);
+		float remoteDragValueDelta(float dx, float dy) const { return (dx - dy) * getRange() / m_speed; }
 
 		static bool isReversed(const Rml::Element* _element);
 		static float mouseWheelValueDelta(float _range, const Rml::Event& _event,
