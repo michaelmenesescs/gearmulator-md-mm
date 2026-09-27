@@ -41,6 +41,7 @@ set(SOURCES
 	rmlRendererJuce.cpp rmlRendererJuce.h
 	rmlShaders.h
 	rmlSystemInterface.cpp rmlSystemInterface.h
+	rmlTouchRouter.cpp rmlTouchRouter.h
 	rmlTree.cpp rmlTree.h
 	rmlTreeNode.cpp rmlTreeNode.h
 
@@ -122,4 +123,9 @@ if(BUILD_TESTING)
 	target_link_libraries(juceRmlMouseInputTest PRIVATE juceRmlUi)
 	set_property(TARGET juceRmlMouseInputTest PROPERTY FOLDER "juceRmlUi/test")
 	add_test(NAME juceRmlMouseInputTest COMMAND juceRmlMouseInputTest)
+
+	add_executable(juceRmlTouchRouterTest test/rmlTouchRouter_test.cpp)
+	target_link_libraries(juceRmlTouchRouterTest PRIVATE juceRmlUi)
+	set_property(TARGET juceRmlTouchRouterTest PROPERTY FOLDER "juceRmlUi/test")
+	add_test(NAME juceRmlTouchRouterTest COMMAND juceRmlTouchRouterTest)
 endif()

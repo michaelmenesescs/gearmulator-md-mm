@@ -536,6 +536,30 @@ namespace juceRmlUi
 		if (isVisible() && m_metalContext)
 			attachMetalContext();
 #endif
+
+		// A hidden panel never receives the matching touch-ups.
+		if (!isVisible())
+			cancelTouches();
+	}
+
+	bool RmlComponent::isTouch(const juce::MouseEvent& _event)
+	{
+		return _event.source.isTouch() || _event.source.isPen();
+	}
+
+	void RmlComponent::cancelTouches()
+	{
+		if (!m_rmlContext)
+			return;
+
+		RmlInterfaces::ScopedAccess access(*this);
+
+		if (m_touchRouter.cancelAll())
+		{
+			m_rmlContext->ProcessMouseButtonUp(0, 0);
+			m_rmlContext->ProcessMouseLeave();
+		}
+		enqueueUpdate();
 	}
 
 	void RmlComponent::mouseDown(const juce::MouseEvent& _event)
@@ -547,6 +571,17 @@ namespace juceRmlUi
 		// in sync here as well as in mouseMove(), because a resize/display-scale
 		// change can otherwise leave the first click using stale coordinates.
 		const auto pos = toRmlPosition(_event);
+
+		// Fingers are routed individually so that several can hold controls at once,
+		// see TouchRouter. Only a finger it hands back uses the context mouse.
+		if (isTouch(_event) && m_touchRouter.down(*m_rmlContext, _event.source.getIndex(),
+			{ pos.x, pos.y }, toRmlModifiers(_event)) != TouchRouter::Route::Context)
+		{
+			logPointerDiagnostic("touchdown", _event, pos);
+			enqueueUpdate();
+			return;
+		}
+
 		mouseInput::processButtonDown(*m_rmlContext, { pos.x, pos.y },
 			static_cast<int>(helper::toRmlMouseButton(_event)), toRmlModifiers(_event));
 		logPointerDiagnostic("down", _event, pos);
@@ -558,6 +593,21 @@ namespace juceRmlUi
 		Component::mouseUp(_event);
 		RmlInterfaces::ScopedAccess access(*this);
 		const auto pos = toRmlPosition(_event);
+
+		if (isTouch(_event))
+		{
+			if (m_touchRouter.up(_event.source.getIndex(), { pos.x, pos.y }, toRmlModifiers(_event))
+				== TouchRouter::Route::Context)
+			{
+				// Fingers do not hover. Leaving the context mouse parked over the
+				// released element would send it a late Mouseout later on.
+				mouseInput::processButtonUp(*m_rmlContext, { pos.x, pos.y }, 0, toRmlModifiers(_event));
+				m_rmlContext->ProcessMouseLeave();
+			}
+			enqueueUpdate();
+			return;
+		}
+
 		mouseInput::processButtonUp(*m_rmlContext, { pos.x, pos.y },
 			static_cast<int>(helper::toRmlMouseButton(_event)), toRmlModifiers(_event));
 		enqueueUpdate();
@@ -566,6 +616,12 @@ namespace juceRmlUi
 	void RmlComponent::mouseMove(const juce::MouseEvent& _event)
 	{
 		Component::mouseMove(_event);
+
+		// A finger only moves while it is down (mouseDrag). JUCE's synthetic
+		// pre-touch move must not move the context mouse away from another finger.
+		if (isTouch(_event))
+			return;
+
 		RmlInterfaces::ScopedAccess access(*this);
 
 		const auto pos = toRmlPosition(_event);
@@ -581,6 +637,13 @@ namespace juceRmlUi
 
 		const auto pos = toRmlPosition(_event);
 
+		if (isTouch(_event) && m_touchRouter.move(_event.source.getIndex(), { pos.x, pos.y },
+			toRmlModifiers(_event)) != TouchRouter::Route::Context)
+		{
+			enqueueUpdate();
+			return;
+		}
+
 		m_rmlContext->ProcessMouseMove(pos.x, pos.y, toRmlModifiers(_event));
 
 		// forward out-of-bounds drag events to the drag handler to allow it to convert to a juce drag if the drag source can export files
@@ -593,6 +656,12 @@ namespace juceRmlUi
 	void RmlComponent::mouseExit(const juce::MouseEvent& _event)
 	{
 		Component::mouseExit(_event);
+
+		// Touch hover is cleared on touch-up; a finger leaving must not unhover the
+		// element that another finger is using through the context.
+		if (isTouch(_event))
+			return;
+
 		RmlInterfaces::ScopedAccess access(*this);
 		if (m_rmlContext)
 			m_rmlContext->ProcessMouseLeave();
@@ -603,6 +672,10 @@ namespace juceRmlUi
 	void RmlComponent::mouseEnter(const juce::MouseEvent& _event)
 	{
 		Component::mouseEnter(_event);
+
+		if (isTouch(_event))
+			return;
+
 		RmlInterfaces::ScopedAccess access(*this);
 
 		const auto pos = toRmlPosition(_event);
@@ -1321,6 +1394,10 @@ namespace juceRmlUi
 
 	void RmlComponent::destroyRmlContext()
 	{
+		// No events here: listeners may belong to an owner that is already being
+		// torn down. The elements themselves are about to go away.
+		m_touchRouter.forgetAll();
+
 		{
 			std::scoped_lock lock(m_timerMutex);
 			stopTimer();

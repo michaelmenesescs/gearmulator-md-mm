@@ -3,6 +3,7 @@
 #include <juce_audio_processors/juce_audio_processors.h>
 
 #include <atomic>
+#include <chrono>
 #include <mutex>
 
 #include "bypassBuffer.h"
@@ -203,6 +204,10 @@ namespace pluginLib
 	protected:
 		void destroyController();
 		void handleAsyncUpdate() override;
+		// Audio thread, after the device rendered and output gain was applied. Must be
+		// realtime-safe. _callbackStart was taken on entry to processBlock.
+		virtual void onAudioRendered(const synthLib::TAudioOutputs&, size_t /*_numSamples*/,
+			std::chrono::steady_clock::time_point /*_callbackStart*/) {}
 
 	private:
 		void prepareToPlay(double sampleRate, int maximumExpectedSamplesPerBlock) override;

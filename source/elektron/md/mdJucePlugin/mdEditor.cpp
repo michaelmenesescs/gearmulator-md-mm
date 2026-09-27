@@ -3,6 +3,7 @@
 #include "mdController.h"
 #include "mdPanelAffordances.h"
 #include "mdPluginProcessor.h"
+#include "mdRemotePanel.h"
 #include "mdSettingsAudioInput.h"
 #include "mdSettingsPanelFeel.h"
 #include "mdPixelPerfectPanel.h"
@@ -31,6 +32,7 @@
 #include "juceRmlUi/rmlElemKnob.h"
 #include "juceRmlUi/rmlEventListener.h"
 #include "juceRmlUi/rmlHelper.h"
+#include "juceRmlUi/rmlTouchRouter.h"
 #include "juceRmlUi/juceRmlComponent.h"
 
 #include "RmlUi/Core/Element.h"
@@ -87,6 +89,10 @@ namespace mdJucePlugin
 		// Arbitrary endless-knob value range; only per-move deltas are used.
 		constexpr float g_encoderRange = 100.0f;
 		constexpr int g_encoderBurstCap = 8;	// max ±1 events emitted per Change
+		// Touch: holding an encoder this long without moving presses it; moving further
+		// than the slop (in document pixels) first makes the gesture a plain turn.
+		constexpr double g_touchEncoderHoldMilliseconds = 400.0;
+		constexpr float g_touchEncoderHoldSlop = 10.0f;
 		constexpr int g_presentationTimerId = 1;
 		constexpr int g_panelTimerId = 2;
 		constexpr int g_presentationTimerIntervalMilliseconds = 16;
@@ -147,6 +153,8 @@ namespace mdJucePlugin
 
 	Editor::~Editor()
 	{
+		if(auto* remote = dynamic_cast<const AudioPluginAudioProcessor&>(getProcessor()).getRemotePanel())
+			remote->detachEditor(this);
 		juce::Desktop::getInstance().removeFocusChangeListener(this);
 		m_panelSteps.clear();
 		cancelPanelInputGestures();
@@ -171,6 +179,15 @@ namespace mdJucePlugin
 		auto& diagnostics = plugin.getRealtimeInstrumentation();
 		const auto model = static_cast<uint32_t>(getModel());
 		const auto token = diagnostics.beginPanelInput(model, _command, _argument);
+		// Scan rows are shared with remote touch panels: merge there so neither side
+		// releases a bit the other still holds. Encoder pulses need no merging.
+		auto* const remote = dynamic_cast<const AudioPluginAudioProcessor&>(getProcessor()).getRemotePanel();
+		if(remote && RemotePanel::isRowCommand(_command))
+		{
+			const auto merged = remote->submitEditorRow(_command, _argument);
+			diagnostics.endPanelInput(token, model, _command, _argument, merged);
+			return merged;
+		}
 		const auto accepted = plugin.withDeviceLocked(
 			[&](synthLib::Device* const _device)
 			{
@@ -225,6 +242,7 @@ namespace mdJucePlugin
 		m_lcdInteractionInputChanged = !m_frontPanelSnapshotValid || m_lcdChanged
 			|| lcdInteraction::classificationLedsChanged(
 				m_frontPanelSnapshot, published.panel, getModel());
+		m_remoteLedSequence = published.ledSequence;
 		m_frontPanelSnapshot = std::move(published.panel);
 
 		if(m_ledResyncPending && published.ledSequence >= m_ledResyncSequence)
@@ -286,6 +304,8 @@ namespace mdJucePlugin
 		createLeds();
 		createPanelAffordances();
 		applyPixelPerfectPanel();
+		if(auto* remote = dynamic_cast<const AudioPluginAudioProcessor&>(getProcessor()).getRemotePanel())
+			remote->attachEditor(this);
 
 		// A transfer belongs to the emulated machine, not the lifetime of one
 		// editor window. Reattach progress monitoring after a reopen, or reclaim a
@@ -329,6 +349,7 @@ namespace mdJucePlugin
 		m_lcdCanvas = juceRmlUi::ElemCanvas::create(lcdArea);
 		m_lcdCanvas->setClearEveryFrame(true);
 		m_lcdCanvas->SetProperty(Rml::PropertyId::Drag, Rml::Style::Drag::Drag);
+		juceRmlUi::TouchRouter::setTouchCapture(m_lcdCanvas);
 		m_lcdCanvas->setRepaintGraphicsCallback([this](const juce::Image& _image, juce::Graphics& _g)
 		{
 			paintLcd(_image, _g);
@@ -347,8 +368,8 @@ namespace mdJucePlugin
 				if(!target)
 					return;
 				const auto mouse = juceRmlUi::helper::getMousePos(_event);
-				(void)m_lcdDragGesture.begin(*m_lcdInteractionState, *target,
-					mouse.x, mouse.y);
+				if(m_lcdDragGesture.begin(*m_lcdInteractionState, *target, mouse.x, mouse.y))
+					m_lcdGestureTouch = juceRmlUi::TouchRouter::getTouchId(_event);
 				// RmlUi arms its drag source only after mousedown propagation completes.
 				// Stopping this event prevents every subsequent Drag event.
 			});
@@ -489,6 +510,7 @@ namespace mdJucePlugin
 	void Editor::cancelLcdGesture()
 	{
 		m_lcdDragGesture.cancel();
+		m_lcdGestureTouch = -1;
 	}
 
 	void Editor::applyPixelPerfectPanel()
@@ -525,6 +547,11 @@ namespace mdJucePlugin
 				b->SetProperty(Rml::PropertyId::PointerEvents, Rml::Style::PointerEvents::None);
 				continue;
 			}
+
+			b->SetAttribute("remote-slot", static_cast<int>(pb.control));
+
+			// Every panel switch is held by its own finger.
+			juceRmlUi::TouchRouter::setTouchCapture(b);
 
 			// On the hardware, A/E through D/H are held while a trig key chooses the
 			// pattern number. A normal MM bank click therefore keeps its existing latch.
@@ -584,7 +611,7 @@ namespace mdJucePlugin
 			juceRmlUi::EventListener::Add(document, Rml::EventId::Keyup,
 				[this](const Rml::Event& _event)
 				{
-					if(!juceRmlUi::helper::getKeyModAlt(_event))
+					if(!juceRmlUi::helper::getKeyModAlt(_event) && m_encoderPressTouch < 0)
 						releaseEncoderPress();
 					if(_event.GetParameter<int>("shift_key", 0) == 0
 						&& !m_shiftPanelLatch.empty())
@@ -601,20 +628,29 @@ namespace mdJucePlugin
 					_event.StopPropagation();
 					cancelPanelInputGestures();
 				});
+			// Only the pointer that started a gesture ends it: with several fingers
+			// down, every other finger's release bubbles up here as well.
 			juceRmlUi::EventListener::Add(document, Rml::EventId::Mouseup,
 				[this](Rml::Event& _event)
 				{
-					if(juceRmlUi::helper::getMouseButton(_event) == juceRmlUi::MouseButton::Left)
-					{
+					if(juceRmlUi::helper::getMouseButton(_event) != juceRmlUi::MouseButton::Left)
+						return;
+					const auto touch = juceRmlUi::TouchRouter::getTouchId(_event);
+					if(m_touchEncoderHold && m_touchEncoderHold->touch == touch)
+						m_touchEncoderHold.reset();
+					if(touch == m_encoderPressTouch)
 						releaseEncoderPress();
+					if(touch == m_lcdGestureTouch)
 						cancelLcdGesture();
-					}
 				});
 			juceRmlUi::EventListener::Add(document, Rml::EventId::Dragend,
 				[this](Rml::Event&)
 				{
-					releaseEncoderPress();
-					cancelLcdGesture();
+					// RmlUi drags come from the mouse, never from a captured finger.
+					if(m_encoderPressTouch < 0)
+						releaseEncoderPress();
+					if(m_lcdGestureTouch < 0)
+						cancelLcdGesture();
 				});
 		}
 	}
@@ -692,6 +728,7 @@ namespace mdJucePlugin
 			if(!element)
 				return;
 			element->SetClass(panelAffordances::g_affordanceClass, true);
+			juceRmlUi::TouchRouter::setTouchCapture(element);
 			juceRmlUi::EventListener::Add(element, Rml::EventId::Click, [this, _select](Rml::Event&)
 			{
 				releasePanelButtonGestures();
@@ -746,6 +783,7 @@ namespace mdJucePlugin
 			return;
 
 		element->SetClass(panelAffordances::g_affordanceClass, true);
+		juceRmlUi::TouchRouter::setTouchCapture(element);
 		juceRmlUi::EventListener::Add(element, Rml::EventId::Mousedown,
 			[this, element, _control](Rml::Event&)
 		{
@@ -764,6 +802,7 @@ namespace mdJucePlugin
 			return;
 
 		element->SetClass(panelAffordances::g_affordanceClass, true);
+		juceRmlUi::TouchRouter::setTouchCapture(element);
 		juceRmlUi::EventListener::Add(element, Rml::EventId::Mousedown,
 			[this, element, _control](Rml::Event&)
 		{
@@ -863,6 +902,8 @@ namespace mdJucePlugin
 		if(m_pressedEncoder)
 			m_pressedEncoder->SetClass("encoderPressed", false);
 		m_pressedEncoder = nullptr;
+		m_encoderPressTouch = -1;
+		m_touchEncoderHold.reset();
 		if(wasActive)
 		{
 			// The held-switch state is a classifier input. Restore hit targets
@@ -870,6 +911,53 @@ namespace mdJucePlugin
 			m_lcdInteractionInputChanged = true;
 			updateLcdInteractionState();
 		}
+	}
+
+	void Editor::beginEncoderPress(juceRmlUi::ElemKnob* const _knob,
+		const std::optional<md::PanelPacket>& _packet, const bool _left, const bool _alt, const int _touch)
+	{
+		if(!m_encoderPress.begin(_packet, _left, _alt))
+			return;
+
+		// Suppress LCD hit targets immediately, before firmware has time
+		// to draw the held-value overlay on the next presentation tick.
+		m_lcdInteractionInputChanged = true;
+		updateLcdInteractionState();
+		m_pressedEncoder = _knob;
+		m_encoderPressTouch = _touch;
+		_knob->SetClass("encoderPressed", true);
+		const auto combined = m_panelRows.press(*_packet);
+		(void)sendPanelEvent(combined.row, combined.mask);
+	}
+
+	bool Editor::isTouchHeld(const int _touch) const
+	{
+		const auto* rml = getRmlComponent();
+		return rml && rml->getTouchRouter().isCaptured(_touch);
+	}
+
+	void Editor::serviceTouchEncoderHold(const double _nowMilliseconds)
+	{
+		// The press is owned by a finger: it ends with that finger, nothing else.
+		if(m_encoderPress.active() && m_encoderPressTouch >= 0 && !isTouchHeld(m_encoderPressTouch))
+			releaseEncoderPress();
+
+		if(!m_touchEncoderHold)
+			return;
+
+		const auto hold = *m_touchEncoderHold;
+		if(!isTouchHeld(hold.touch))
+		{
+			m_touchEncoderHold.reset();
+			return;
+		}
+		if(_nowMilliseconds - hold.startMilliseconds < g_touchEncoderHoldMilliseconds)
+			return;
+
+		m_touchEncoderHold.reset();
+		// One encoder press at a time, as with the mouse; the newest hold wins.
+		releaseEncoderPress();
+		beginEncoderPress(hold.knob, hold.packet, true, true, hold.touch);
 	}
 
 	void Editor::globalFocusChanged(juce::Component* const _focusedComponent)
@@ -1763,6 +1851,8 @@ namespace mdJucePlugin
 		if(!_knob)
 			return;
 
+		_knob->SetAttribute("remote-slot", 64 + static_cast<int>(_encoder));
+
 		// Shift belongs to the MD/MM panel-hold gesture. Keep normal drag speed
 		// while it is down; Command/Ctrl remains the fine-adjustment modifier.
 		_knob->SetAttribute("speedScaleShift", 1.0f);
@@ -1773,21 +1863,32 @@ namespace mdJucePlugin
 			juceRmlUi::EventListener::Add(_knob, Rml::EventId::Mousedown,
 				[this, _knob, packet](Rml::Event& _event)
 				{
+					const auto touch = juceRmlUi::TouchRouter::getTouchId(_event);
+					if(touch >= 0)
+					{
+						// Leave any press held by another finger alone; this finger
+						// presses only once it has rested here long enough.
+						const auto mouse = juceRmlUi::helper::getMousePos(_event);
+						m_touchEncoderHold = TouchEncoderHold{ _knob, packet, touch, mouse.x, mouse.y,
+							juce::Time::getMillisecondCounterHiRes() };
+						return;
+					}
 					releaseEncoderPress();
-					if(m_encoderPress.begin(packet,
+					beginEncoderPress(_knob, packet,
 						juceRmlUi::helper::getMouseButton(_event) == juceRmlUi::MouseButton::Left
 							&& !juceRmlUi::helper::isContextMenu(_event),
-						juceRmlUi::helper::getKeyModAlt(_event)))
-					{
-						// Suppress LCD hit targets immediately, before firmware has time
-						// to draw the held-value overlay on the next presentation tick.
-						m_lcdInteractionInputChanged = true;
-						updateLcdInteractionState();
-						m_pressedEncoder = _knob;
-						_knob->SetClass("encoderPressed", true);
-						const auto combined = m_panelRows.press(*packet);
-						(void)sendPanelEvent(combined.row, combined.mask);
-					}
+						juceRmlUi::helper::getKeyModAlt(_event), -1);
+				});
+			juceRmlUi::EventListener::Add(_knob, Rml::EventId::Drag,
+				[this, _knob](Rml::Event& _event)
+				{
+					if(!m_touchEncoderHold || m_touchEncoderHold->knob != _knob
+						|| m_touchEncoderHold->touch != juceRmlUi::TouchRouter::getTouchId(_event))
+						return;
+					const auto mouse = juceRmlUi::helper::getMousePos(_event);
+					if(std::abs(mouse.x - m_touchEncoderHold->x) + std::abs(mouse.y - m_touchEncoderHold->y)
+						> g_touchEncoderHoldSlop)
+						m_touchEncoderHold.reset();
 				});
 		}
 		_knob->setMinValue(0.0f);
@@ -2057,8 +2158,10 @@ namespace mdJucePlugin
 
 		const auto nowMilliseconds = juce::Time::getMillisecondCounterHiRes();
 		const auto modifiers = juce::ModifierKeys::getCurrentModifiersRealtime();
-		if(m_encoderPress.active() && (!modifiers.isAltDown() || !modifiers.isLeftButtonDown()))
+		if(m_encoderPress.active() && m_encoderPressTouch < 0
+			&& (!modifiers.isAltDown() || !modifiers.isLeftButtonDown()))
 			releaseEncoderPress();
+		serviceTouchEncoderHold(nowMilliseconds);
 		// Some plugin hosts can lose the modifier key-up when focus changes. Poll
 		// native state as a fail-safe so no panel row remains held indefinitely.
 		if(!m_shiftPanelLatch.empty()

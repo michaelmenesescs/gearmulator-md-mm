@@ -27,6 +27,10 @@ set(SOURCES
 	mdProductSkinPolicy.h
 	mdProductSkins.h
 	mdPluginProcessor.cpp mdPluginProcessor.h
+	mdRemotePanel.cpp mdRemotePanel.h
+	mdRemotePanelV3.cpp
+	mdRemotePanelProtocol.h
+	mdRemotePanelServer.cpp mdRemotePanelServer.h
 	mdStorageImage.cpp mdStorageImage.h
 	mdPluginEntry.cpp
 
@@ -68,8 +72,26 @@ juce_add_binary_data(mmJucePlugin_BinaryData SOURCES
 	${COMMON_ASSETS} "tus_settings_gui_Monomachine.rml"
 	"tus_settings_dspaudio_Monomachine.rml" ${MM_SKIN_ASSETS})
 
+# Private local iOS test builds only: optionally embed the user's own ROM in
+# the matching app bundle. Each product gets its own variable so an MD ROM can
+# never end up in the MM app or vice versa. GEARMULATOR_IOS_ROM is the legacy
+# Machinedrum-only name and is still honoured for MD.
+set(GEARMULATOR_IOS_ROM_MD "" CACHE FILEPATH "iOS only: private Machinedrum ROM to embed in a local test bundle")
+set(GEARMULATOR_IOS_ROM_MM "" CACHE FILEPATH "iOS only: private Monomachine ROM to embed in a local test bundle")
+if(NOT GEARMULATOR_IOS_ROM_MD AND GEARMULATOR_IOS_ROM)
+	set(GEARMULATOR_IOS_ROM_MD "${GEARMULATOR_IOS_ROM}")
+endif()
+
+set(iosRomFile "${GEARMULATOR_IOS_ROM_MD}")
+set(iosRomName "machinedrum.bin")
 createJucePlugin(mdJucePlugin "Gearmulator MD" TRUE "Tmdr" mdJucePlugin_BinaryData mdLib)
+
+set(iosRomFile "${GEARMULATOR_IOS_ROM_MM}")
+set(iosRomName "monomachine.bin")
 createJucePlugin(mmJucePlugin "Gearmulator MM" TRUE "Tmno" mmJucePlugin_BinaryData mdLib)
+
+unset(iosRomFile)
+unset(iosRomName)
 
 # MD/MM expose an optional stereo input to plug-in hosts. Starting the
 # standalone with that input active makes CoreAudio combine the built-in input

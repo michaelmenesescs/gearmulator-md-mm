@@ -5,6 +5,8 @@
 #include "synthLib/performanceReport.h"
 
 #include <atomic>
+#include <chrono>
+#include <memory>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -13,6 +15,8 @@
 
 namespace mdJucePlugin
 {
+	class RemotePanel;
+
 	class AudioPluginAudioProcessor : public jucePluginEditorLib::Processor,
 		private juce::Timer
 	{
@@ -55,6 +59,9 @@ namespace mdJucePlugin
 				m_ramRecordingMode.load(std::memory_order_relaxed));
 		}
 		bool isRamRecordingModeAvailable();
+		// LAN touch panel (iPad); null when disabled or for test/ephemeral instances.
+		RemotePanel* getRemotePanel() const { return m_remotePanel.get(); }
+
 
 	    jucePluginEditorLib::PluginEditorState* createEditorState() override;
 	    synthLib::Device* createDevice() override;
@@ -77,6 +84,8 @@ namespace mdJucePlugin
 		void recordStandaloneStartupDiagnostics();
 		void reportProjectStateRestoreFailure(const std::string& _error);
 		void timerCallback() override;
+		void onAudioRendered(const synthLib::TAudioOutputs& _outputs, size_t _numSamples,
+			std::chrono::steady_clock::time_point _callbackStart) override;
 
 		std::unique_ptr<synthLib::PerformanceReport> m_performanceReport;
 		juce::File m_performanceReportFile;
@@ -92,6 +101,7 @@ namespace mdJucePlugin
 		std::atomic<uint8_t> m_ramRecordingMode{
 			static_cast<uint8_t>(md::RamRecordingMode::Original)};
 		bool m_ramRecordingModeChunkSeen = false;
+		std::unique_ptr<RemotePanel> m_remotePanel;
 		JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(AudioPluginAudioProcessor)
 	};
 }
