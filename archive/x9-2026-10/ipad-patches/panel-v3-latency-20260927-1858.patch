@@ -1,0 +1,1344 @@
+diff --git a/doc/remote-panel-v3.md b/doc/remote-panel-v3.md
+index 84697ab5..c7fa35e6 100644
+--- a/doc/remote-panel-v3.md
++++ b/doc/remote-panel-v3.md
+@@ -120,7 +120,7 @@ Encoder movement follows the real knob's configured range and speed:
+ Accumulate fractional deltas per driving contact; truncate toward zero to whole detents.
+ Only the first contact on one knob drives motion; additional contacts hold passively and
+ are not promoted to drivers when it lifts. Independent knobs have independent accumulators.
+-A stationary hold presses after 400 ms, serviced at 20 ms opportunities. Moving more than
++A stationary hold presses after 400 ms, serviced at 5–20 ms timer opportunities. Moving more than
+ 10 **context units of Manhattan distance** before that disables the pending hold. A held
+ encoder may subsequently turn while pressed. A quick tap does not press. Passive contacts
+ share the group's hold decision and keep its press owned until their releases. An unsupported
+@@ -234,16 +234,21 @@ offset 0 u8 15 hex, 1 u32 generation, 5 u64 capture sequence. The sequence must
+ no newer than a fully sent frame for this session and generation. Acknowledge each displayed
+ keyframe; only the first is needed to unlock interaction in that generation.
+ 
+-Capture opportunities are at most about 15/s (67 ms minimum, on a 20 ms timer, so actual
+-opportunities can be lower). `captureRequested`, `captureAccepted`, `captureCompleted` are
+-separate cumulative counters. The callback only bounds/checks/copies pixels into one newest
+-pending capture. PNG compression runs on a dedicated worker, separate from input ingress and
+-encoder remainder draining. Equal encoded pixels suppress transmission, though capture and
+-compression still cost CPU while idle. These are not measured frame-rate or CPU promises.
++Capture cadence is adaptive (see `remote-panel-v3-latency.md`). Idle: one capture per 200 ms
++on a 20 ms timer. Fast (a Touch is down, a Touch was just handled, LCD/LED contents changed, or
++the last capture's pixels differed; held for 600 ms after the last such signal): at most one
++per 33 ms on a 5 ms timer, additionally paced so that a capture is only requested once the
++per-client budget below could send the previous keyframe whole. `captureRequested`,
++`captureAccepted`, `captureCompleted` are separate cumulative counters. The callback only
++bounds/checks/copies pixels into one newest pending capture and wakes the worker. PNG
++compression runs on that dedicated worker, separate from input ingress and encoder remainder
++draining. A capture whose pixels equal the live keyframe's is neither encoded nor sent. The
++PNG is ordinary and lossless (RGB8 when every pixel is opaque, else RGBA8; Up-filtered rows,
++zlib level 3); any PNG decoder applies. These are not measured frame-rate or CPU promises.
+ 
+ Each client retains one in-progress immutable PNG plus access to the global newest PNG;
+ intermediate frames coalesce. A token bucket limits PanelChunk payloads to 1,250,000 B/s
+-with at most 32,768 B burst credit, initially 16,384 B. One ≤16,425 B message is sent between
++with at most 131,072 B burst credit (one whole keyframe), initially 16,384 B. One ≤16,425 B message is sent between
+ control-queue drains. Control traffic, source messages, WebSocket/TCP headers and legacy LCD
+ frames are outside this budget. A two-second socket send timeout bounds a stalled write;
+ chunks still cannot preempt bytes already in TCP, so zero ack latency is **not** promised.
+diff --git a/source/elektron/md/mdJucePlugin/CMakeLists.txt b/source/elektron/md/mdJucePlugin/CMakeLists.txt
+index d319725c..4e4b0a92 100644
+--- a/source/elektron/md/mdJucePlugin/CMakeLists.txt
++++ b/source/elektron/md/mdJucePlugin/CMakeLists.txt
+@@ -29,6 +29,8 @@ set(SOURCES
+ 	mdPluginProcessor.cpp mdPluginProcessor.h
+ 	mdRemotePanel.cpp mdRemotePanel.h
+ 	mdRemotePanelV3.cpp
++	mdRemotePanelPng.cpp mdRemotePanelPng.h
++	mdRemotePanelCapturePolicy.h
+ 	mdRemotePanelProtocol.h
+ 	mdRemotePanelServer.cpp mdRemotePanelServer.h
+ 	mdStorageImage.cpp mdStorageImage.h
+@@ -225,6 +227,13 @@ if(BUILD_TESTING)
+ 		LABELS "UnitTest;Rendering")
+ 	set_property(TARGET mdStandaloneRendererPolicyTest PROPERTY FOLDER "Elektron/test")
+ 
++	add_executable(mdRemotePanelPngTest mdRemotePanelPngTest.cpp mdRemotePanelPng.cpp)
++	target_link_libraries(mdRemotePanelPngTest PRIVATE juce_plugin_modules)
++	target_compile_definitions(mdRemotePanelPngTest PRIVATE JUCE_GLOBAL_MODULE_SETTINGS_INCLUDED=1)
++	add_test(NAME mdRemotePanelPngTest COMMAND mdRemotePanelPngTest)
++	set_tests_properties(mdRemotePanelPngTest PROPERTIES LABELS "UnitTest")
++	set_property(TARGET mdRemotePanelPngTest PROPERTY FOLDER "Elektron/test")
++
+ 	add_executable(mdPanelRenderingTest mdPanelRenderingTest.cpp mdPixelPerfectPanel.cpp)
+ 	target_link_libraries(mdPanelRenderingTest PRIVATE juceRmlUi juceUiLib juce_plugin_modules juce::juce_opengl)
+ 	target_compile_definitions(mdPanelRenderingTest PRIVATE JUCE_GLOBAL_MODULE_SETTINGS_INCLUDED=1)
+diff --git a/source/elektron/md/mdJucePlugin/mdRemotePanel.cpp b/source/elektron/md/mdJucePlugin/mdRemotePanel.cpp
+index a312b249..127a3bd7 100644
+--- a/source/elektron/md/mdJucePlugin/mdRemotePanel.cpp
++++ b/source/elektron/md/mdJucePlugin/mdRemotePanel.cpp
+@@ -94,7 +94,10 @@ namespace mdJucePlugin
+ 		m_captureWorker = std::thread([this] {
+ 			while(m_running) {
+ 				servicePanelCapture();
+-				std::this_thread::sleep_for(std::chrono::milliseconds(5));
++				// Woken by the screenshot callback; the timeout only bounds shutdown.
++				std::unique_lock lock(m_panelMutex);
++				m_captureCv.wait_for(lock, std::chrono::milliseconds(20),
++					[this] { return !m_running || !m_pendingCapture.image.isNull(); });
+ 			}
+ 		});
+ 		log(std::string("listening on port ") + std::to_string(m_server.port()) + " model "
+@@ -107,6 +110,7 @@ namespace mdJucePlugin
+ 		cancelPendingUpdate();
+ 		m_captureLifetime.reset();
+ 		m_running = false;
++		m_captureCv.notify_all();
+ 		if(m_pump.joinable())
+ 			m_pump.join();
+ 		if(m_captureWorker.joinable()) m_captureWorker.join();
+@@ -457,6 +461,7 @@ namespace mdJucePlugin
+ 		next.inputEpoch = epoch;
+ 		m_snapshot = next;
+ 		++m_displayChanges;
++		++m_displaySequence;
+ 		return true;
+ 	}
+ 
+diff --git a/source/elektron/md/mdJucePlugin/mdRemotePanel.h b/source/elektron/md/mdJucePlugin/mdRemotePanel.h
+index a7646f5d..f52eb07e 100644
+--- a/source/elektron/md/mdJucePlugin/mdRemotePanel.h
++++ b/source/elektron/md/mdJucePlugin/mdRemotePanel.h
+@@ -9,6 +9,7 @@
+ #include <string>
+ #include <thread>
+ #include <vector>
++#include <condition_variable>
+ #include <deque>
+ #include "juce_gui_basics/juce_gui_basics.h"
+ #include "RmlUi/Core/ObserverPtr.h"
+@@ -17,6 +18,7 @@ namespace Rml { class Element; }
+ #include "mdRemotePanelProtocol.h"
+ #include "mdRemotePanelOwnership.h"
+ #include "mdRemotePanelServer.h"
++#include "mdRemotePanelCapturePolicy.h"
+ 
+ #include "mdLib/mdtypes.h"
+ 
+@@ -209,10 +211,15 @@ namespace mdJucePlugin
+ 		std::atomic<bool> m_sourceAvailable{false};
+ 		std::atomic<uint64_t> m_lastCaptureUs{0};
+ 		std::atomic<uint8_t> m_sourceReason{1};
+-		uint64_t m_lastCaptureRequestUs=0;
++		remotePanel::CapturePolicy m_capturePolicy; // message thread only
++		uint64_t m_seenDisplaySequence=0, m_seenPixelChanges=0, m_seenPublishedBytes=0; // message thread only
++		std::atomic<uint64_t> m_publishedBytes{0}, m_lastPublishedBytes{0};	// worker: keyframes handed to the writers
++		std::atomic<uint64_t> m_displaySequence{0};	// pump: LCD/LED contents changed
++		std::atomic<uint64_t> m_pixelChanges{0};		// worker: published pixels differed
++		std::condition_variable m_captureCv;			// wakes the worker when a capture is pending
+ 		std::atomic<uint64_t> m_captureRequested{0},m_captureAccepted{0},m_captureCompleted{0};
+ 		std::atomic<uint64_t> m_panelBytes{0},m_panelFrames{0},m_touchReceived{0};
+-		std::vector<uint8_t> m_lastPng; // worker only
++		juce::Image m_lastImage; // worker only: pixels of the published keyframe
+ 
+ 		// Counters.
+ 		std::atomic<uint64_t> m_inputs{0};
+diff --git a/source/elektron/md/mdJucePlugin/mdRemotePanelV3.cpp b/source/elektron/md/mdJucePlugin/mdRemotePanelV3.cpp
+index a45e5cbf..f88dceb7 100644
+--- a/source/elektron/md/mdJucePlugin/mdRemotePanelV3.cpp
++++ b/source/elektron/md/mdJucePlugin/mdRemotePanelV3.cpp
+@@ -1,4 +1,5 @@
+ #include "mdRemotePanel.h"
++#include "mdRemotePanelPng.h"
+ #include "mdEditor.h"
+ #include "juceRmlUi/juceRmlComponent.h"
+ #include "juceRmlUi/rmlInterfaces.h"
+@@ -25,7 +26,7 @@ void RemotePanel::attachEditor(Editor* editor) {
+  jassert(juce::MessageManager::getInstance()->isThisTheMessageThread());
+  if(m_editor) detachEditor(m_editor);
+  m_editor=editor;
+- startTimer(20);
++ startTimer(CapturePolicy::g_idleTimerMs);
+ }
+ void RemotePanel::detachEditor(Editor* editor) {
+  if(m_editor!=editor) return;
+@@ -109,9 +110,24 @@ void RemotePanel::timerCallback() {
+   }
+   updateContactVisual(c.element.get());
+  }
++ m_capturePolicy.setTouchActive(!m_contacts.empty());
+  }
+- if(now-m_lastCaptureRequestUs<66667 || m_panelClients.load()==0) return;
+- m_lastCaptureRequestUs=now;
++ // Adaptive cadence: cheap change signals switch to fast captures before any pixels are read.
++ // The display sequence only advances when LCD or LED contents actually differ (pump poll);
++ // the editor's LED publication sequence counts bank writes, so it is not used as activity.
++ const auto display=m_displaySequence.load(), pixels=m_pixelChanges.load();
++ if(display!=m_seenDisplaySequence || pixels!=m_seenPixelChanges) {
++  m_seenDisplaySequence=display; m_seenPixelChanges=pixels;
++  m_capturePolicy.activity(now);
++ }
++ if(const auto published=m_publishedBytes.load(); published!=m_seenPublishedBytes) {
++  m_capturePolicy.keyframePublished(now,size_t(published-m_seenPublishedBytes),size_t(m_lastPublishedBytes.load()));
++  m_seenPublishedBytes=published;
++ }
++ const bool viewers=m_panelClients.load()!=0;
++ const auto timerMs=viewers ? m_capturePolicy.timerMs(now) : CapturePolicy::g_idleTimerMs;
++ if(getTimerInterval()!=timerMs) startTimer(timerMs);
++ if(!viewers || !m_capturePolicy.due(now)) return;
+  ++m_captureRequested;
+  const auto generation=m_geometryGeneration.load();
+  const auto led=m_editor->m_remoteLedSequence;
+@@ -123,10 +139,13 @@ void RemotePanel::timerCallback() {
+    || image.getWidth()!=int(geometry.contextWidth) || image.getHeight()!=int(geometry.contextHeight)) return;
+   Capture c; c.image=image.createCopy(); c.geometry=geometry; c.generation=generation;
+   c.sequence=++m_captureCompleted; c.completedUs=clockUs(); c.ledSequence=led;
+-  std::lock_guard lock(m_panelMutex);
+-  if(generation!=m_geometryGeneration) return;
+-  m_lastCaptureUs=c.completedUs;
+-  m_pendingCapture=std::move(c);
++  {
++   std::lock_guard lock(m_panelMutex);
++   if(generation!=m_geometryGeneration) return;
++   m_lastCaptureUs=c.completedUs;
++   m_pendingCapture=std::move(c);
++  }
++  m_captureCv.notify_one();
+  })) ++m_captureAccepted;
+ }
+ void RemotePanel::servicePanelCapture() {
+@@ -135,11 +154,12 @@ void RemotePanel::servicePanelCapture() {
+  if(c.image.isNull()) return;
+  // Only the existing composed image is scaled. No re-rendering of skin or LCD.
+  if(c.image.getWidth()>1100) c.image=c.image.rescaled(1100,std::max(1,c.image.getHeight()*1100/c.image.getWidth()),juce::Graphics::mediumResamplingQuality);
+- juce::MemoryOutputStream out;
+- if(!juce::PNGImageFormat().writeImageToStream(c.image,out) || out.getDataSize()>2*1024*1024) { sourceUnavailable(5); return; }
++ // Unchanged pixels of a live keyframe are neither encoded nor sent (~0.1 ms instead of an encode).
++ bool live=false;
++ { std::lock_guard lock(m_panelMutex); live=m_sourceAvailable && m_panelImage && m_panelImage->generation==c.generation; }
++ if(live && samePixels(c.image,m_lastImage)) return;
+  auto frame=std::make_shared<PanelImage>();
+- const auto* bytes=static_cast<const uint8_t*>(out.getData());
+- frame->png.assign(bytes,bytes+out.getDataSize());
++ if(!encodePanelPng(c.image,frame->png,{3}) || frame->png.size()>2*1024*1024) { sourceUnavailable(5); return; }
+  frame->generation=c.generation; frame->sequence=c.sequence; frame->completedUs=c.completedUs; frame->ledSequence=c.ledSequence;
+  frame->width=c.image.getWidth(); frame->height=c.image.getHeight();
+  auto& s=frame->source; s={uint8_t(Msg::PanelSource),1,0}; u32(s,c.generation);
+@@ -150,10 +170,12 @@ void RemotePanel::servicePanelCapture() {
+   std::lock_guard lock(m_panelMutex);
+   if(c.generation!=m_geometryGeneration || clockUs()-c.completedUs>750000) return;
+   restored=!m_sourceAvailable;
+-  if(!restored && frame->png==m_lastPng) return;
+-  m_lastPng=frame->png;
+   m_panelImage=frame; m_sourceReason=0; m_sourceAvailable=true;
+  }
++ m_lastImage=c.image;
++ m_lastPublishedBytes=frame->png.size();
++ m_publishedBytes+=frame->png.size();
++ if(!restored) ++m_pixelChanges;
+  if(restored) log("source available generation="+std::to_string(c.generation)+" raster="+std::to_string(frame->width)+"x"+std::to_string(frame->height));
+  m_server.notifyFrame();
+ }
+@@ -315,5 +337,10 @@ void RemotePanel::handleAsyncUpdate() {
+   u32(ack,m_geometryGeneration); u64(ack,e.receivedUs); u64(ack,resolved); u64(ack,enqueued); u32(ack,owners); u32(ack,uint32_t(detents));
+   m_server.send(e.client,std::move(ack));
+  }
++ // Touch input is capture-cadence activity: go fast now rather than at the next idle tick.
++ if(!events.empty() && m_editor && m_panelClients.load()) {
++  m_capturePolicy.activity(clockUs());
++  if(getTimerInterval()!=CapturePolicy::g_fastTimerMs) startTimer(CapturePolicy::g_fastTimerMs);
++ }
+ }
+ }
+diff --git a/source/elektron/md/mdJucePlugin/mdRemotePanelWire.h b/source/elektron/md/mdJucePlugin/mdRemotePanelWire.h
+index a8b29848..ac97295c 100644
+--- a/source/elektron/md/mdJucePlugin/mdRemotePanelWire.h
++++ b/source/elektron/md/mdJucePlugin/mdRemotePanelWire.h
+@@ -26,11 +26,16 @@ inline TouchData decodeTouch(const uint8_t* p,size_t n) {
+  t.phase=p[1]; t.contact=uint16_t(p[2]) | uint16_t(p[3])<<8; t.generation=readU32(p+8);
+  return t;
+ }
++// Per-client PanelChunk token bucket. The sustained rate (1.25 B/us) is unchanged from the
++// first v3 release; the burst cap holds one whole keyframe (~80 kB) so the first frame after
++// a quiet period leaves immediately instead of trickling out over ~40 ms.
++constexpr double g_panelBudgetBytesPerUs=1.25;
++constexpr double g_panelBudgetBurst=131072;
+ struct PanelBudget {
+  uint64_t lastUs=0;
+  double tokens=16384;
+  bool consume(uint64_t now,size_t bytes) {
+-  if(lastUs && now>=lastUs) tokens=std::min(32768.0,tokens+(now-lastUs)*1.25);
++  if(lastUs && now>=lastUs) tokens=std::min(g_panelBudgetBurst,tokens+(now-lastUs)*g_panelBudgetBytesPerUs);
+   lastUs=now;
+   if(tokens<bytes) return false;
+   tokens-=bytes; return true;
+diff --git a/tools/remote-panel-v3/wire_test.cpp b/tools/remote-panel-v3/wire_test.cpp
+index 4e55888f..ad893412 100644
+--- a/tools/remote-panel-v3/wire_test.cpp
++++ b/tools/remote-panel-v3/wire_test.cpp
+@@ -38,7 +38,7 @@ int main() {
+  for(uint64_t us=1000;us<=1001000;us+=1000) if(budget.consume(us,16425)) sent+=16425;
+  CHECK(sent<=1250000+16384 && sent>1200000);
+  CHECK(!budget.consume(1001000,2*1024*1024));
+- budget.consume(2000000,0); CHECK(budget.tokens<=32768);
++ budget.consume(2000000,0); CHECK(budget.tokens<=131072 && budget.tokens>=90000);
+  std::cout << "PASS Touch: LE layout, phases, short/oversize, NaN/Inf, coordinate bounds (-ffast-math)\n";
+- std::cout << "PASS PanelBudget: simulated 1 s bytes=" << sent << " burst<=32768, rejects 2 MiB\n";
++ std::cout << "PASS PanelBudget: simulated 1 s bytes=" << sent << " burst<=131072 (one whole keyframe), rejects 2 MiB\n";
+ }
+diff --git a/source/elektron/md/mdJucePlugin/mdRemotePanelPng.h b/source/elektron/md/mdJucePlugin/mdRemotePanelPng.h
+new file mode 100644
+index 00000000..fba0d0ec
+--- /dev/null
++++ b/source/elektron/md/mdJucePlugin/mdRemotePanelPng.h
+@@ -0,0 +1,24 @@
++#pragma once
++
++#include <cstdint>
++#include <vector>
++
++#include "juce_graphics/juce_graphics.h"
++
++namespace mdJucePlugin::remotePanel
++{
++	// Panel-stream PNG writer. Produces an ordinary, lossless PNG (any decoder reads it),
++	// tuned for per-frame cost rather than size: an opaque capture is written as RGB8 with
++	// no per-pixel unpremultiply, rows use the Up filter, and zlib runs at a low level.
++	// A capture with any non-opaque pixel falls back to RGBA8 (unpremultiplied), so the
++	// decoded pixels always equal what juce::PNGImageFormat would have produced.
++	struct PanelPngOptions
++	{
++		int zlibLevel = 1;
++	};
++
++	bool encodePanelPng(const juce::Image& _image, std::vector<uint8_t>& _out, const PanelPngOptions& _options = {});
++
++	// True if both images have identical dimensions and pixel bytes.
++	bool samePixels(const juce::Image& _a, const juce::Image& _b);
++}
+diff --git a/source/elektron/md/mdJucePlugin/mdRemotePanelPng.cpp b/source/elektron/md/mdJucePlugin/mdRemotePanelPng.cpp
+new file mode 100644
+index 00000000..382b3f3c
+--- /dev/null
++++ b/source/elektron/md/mdJucePlugin/mdRemotePanelPng.cpp
+@@ -0,0 +1,154 @@
++#include "mdRemotePanelPng.h"
++
++#include <array>
++#include <cstring>
++
++namespace mdJucePlugin::remotePanel
++{
++	namespace
++	{
++		const std::array<uint32_t, 256>& crcTable()
++		{
++			static const auto table = []
++			{
++				std::array<uint32_t, 256> t{};
++				for(uint32_t n = 0; n < 256; ++n)
++				{
++					uint32_t c = n;
++					for(int k = 0; k < 8; ++k)
++						c = (c & 1) ? 0xedb88320u ^ (c >> 1) : c >> 1;
++					t[n] = c;
++				}
++				return t;
++			}();
++			return table;
++		}
++
++		uint32_t crc(uint32_t _crc, const uint8_t* _data, const size_t _size)
++		{
++			const auto& t = crcTable();
++			for(size_t i = 0; i < _size; ++i)
++				_crc = t[(_crc ^ _data[i]) & 0xff] ^ (_crc >> 8);
++			return _crc;
++		}
++
++		void be32(std::vector<uint8_t>& _out, const uint32_t _v)
++		{
++			for(int i = 3; i >= 0; --i)
++				_out.push_back(static_cast<uint8_t>(_v >> (8 * i)));
++		}
++
++		void chunk(std::vector<uint8_t>& _out, const char* _type, const uint8_t* _data, const size_t _size)
++		{
++			be32(_out, static_cast<uint32_t>(_size));
++			const auto start = _out.size();
++			_out.insert(_out.end(), _type, _type + 4);
++			if(_size)
++				_out.insert(_out.end(), _data, _data + _size);
++			be32(_out, crc(0xffffffffu, _out.data() + start, _size + 4) ^ 0xffffffffu);
++		}
++
++		bool isOpaque(const juce::Image::BitmapData& _src, const juce::Image& _image)
++		{
++			if(!_image.hasAlphaChannel())
++				return true;
++			if(_image.getFormat() != juce::Image::ARGB)
++				return false;
++			for(int y = 0; y < _src.height; ++y)
++			{
++				const auto* p = _src.getLinePointer(y);
++				for(int x = 0; x < _src.width; ++x, p += _src.pixelStride)
++					if(reinterpret_cast<const juce::PixelARGB*>(p)->getAlpha() != 0xff)
++						return false;
++			}
++			return true;
++		}
++	}
++
++	bool encodePanelPng(const juce::Image& _image, std::vector<uint8_t>& _out, const PanelPngOptions& _options)
++	{
++		_out.clear();
++		if(_image.isNull())
++			return false;
++
++		const juce::Image::BitmapData src(_image, juce::Image::BitmapData::readOnly);
++		const auto width = src.width;
++		const auto height = src.height;
++		const bool opaque = isOpaque(src, _image);
++		const size_t channels = opaque ? 3 : 4;
++		const size_t rowBytes = static_cast<size_t>(width) * channels;
++
++		// Filtered scanlines: one filter byte (2 = Up) per row. The first row's Up
++		// predictor is zero, which is identical to filter None.
++		std::vector<uint8_t> prev(rowBytes, 0), cur(rowBytes), line(rowBytes + 1);
++		juce::MemoryOutputStream idat(rowBytes * static_cast<size_t>(height) / 8 + 1024);
++		{
++			juce::GZIPCompressorOutputStream z(idat, _options.zlibLevel);
++			for(int y = 0; y < height; ++y)
++			{
++				const auto* p = src.getLinePointer(y);
++				auto* d = cur.data();
++				if(_image.getFormat() == juce::Image::ARGB)
++				{
++					for(int x = 0; x < width; ++x, p += src.pixelStride)
++					{
++						auto px = *reinterpret_cast<const juce::PixelARGB*>(p);
++						if(!opaque)
++							px.unpremultiply();
++						*d++ = px.getRed(); *d++ = px.getGreen(); *d++ = px.getBlue();
++						if(!opaque)
++							*d++ = px.getAlpha();
++					}
++				}
++				else if(_image.getFormat() == juce::Image::RGB)
++				{
++					for(int x = 0; x < width; ++x, p += src.pixelStride)
++					{
++						const auto* px = reinterpret_cast<const juce::PixelRGB*>(p);
++						*d++ = px->getRed(); *d++ = px->getGreen(); *d++ = px->getBlue();
++					}
++				}
++				else
++				{
++					return false;
++				}
++				line[0] = 2;
++				for(size_t i = 0; i < rowBytes; ++i)
++					line[i + 1] = static_cast<uint8_t>(cur[i] - prev[i]);
++				if(!z.write(line.data(), line.size()))
++					return false;
++				std::swap(prev, cur);
++			}
++			z.flush();
++		}
++
++		static constexpr uint8_t signature[] = {0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n'};
++		_out.reserve(idat.getDataSize() + 64);
++		_out.insert(_out.end(), signature, signature + sizeof(signature));
++
++		std::vector<uint8_t> ihdr;
++		be32(ihdr, static_cast<uint32_t>(width));
++		be32(ihdr, static_cast<uint32_t>(height));
++		ihdr.push_back(8);						// bit depth
++		ihdr.push_back(opaque ? 2 : 6);			// colour type: RGB / RGBA
++		ihdr.push_back(0); ihdr.push_back(0); ihdr.push_back(0);	// deflate, adaptive filtering, no interlace
++		chunk(_out, "IHDR", ihdr.data(), ihdr.size());
++		chunk(_out, "IDAT", static_cast<const uint8_t*>(idat.getData()), idat.getDataSize());
++		chunk(_out, "IEND", nullptr, 0);
++		return true;
++	}
++
++	bool samePixels(const juce::Image& _a, const juce::Image& _b)
++	{
++		if(_a.isNull() || _b.isNull() || _a.getFormat() != _b.getFormat()
++			|| _a.getWidth() != _b.getWidth() || _a.getHeight() != _b.getHeight())
++			return false;
++		const juce::Image::BitmapData a(_a, juce::Image::BitmapData::readOnly);
++		const juce::Image::BitmapData b(_b, juce::Image::BitmapData::readOnly);
++		const auto bytes = static_cast<size_t>(a.width) * static_cast<size_t>(a.pixelStride);
++		for(int y = 0; y < a.height; ++y)
++			if(std::memcmp(a.getLinePointer(y), b.getLinePointer(y), bytes) != 0)
++				return false;
++		return true;
++	}
++}
+diff --git a/source/elektron/md/mdJucePlugin/mdRemotePanelCapturePolicy.h b/source/elektron/md/mdJucePlugin/mdRemotePanelCapturePolicy.h
+new file mode 100644
+index 00000000..a7c1f3ca
+--- /dev/null
++++ b/source/elektron/md/mdJucePlugin/mdRemotePanelCapturePolicy.h
+@@ -0,0 +1,96 @@
++#pragma once
++
++#include <algorithm>
++#include <cstddef>
++#include <cstdint>
++
++#include "mdRemotePanelWire.h"
++
++namespace mdJucePlugin::remotePanel
++{
++	// Adaptive capture cadence for the v3 panel stream (message thread only).
++	//
++	// Fast while the panel is changing or a finger is down, idle otherwise. "Changing" is
++	// fed by cheap signals that arrive before any pixels are read back: a handled touch, a
++	// change of LCD or LED contents seen by the pump, or the worker reporting that the last
++	// capture differed from the one before it. Idle captures are still taken (the
++	// viewer's 750 ms freshness deadline needs them) but identical pixels are neither
++	// encoded nor sent, so an unchanging panel still transmits zero PanelChunk bytes.
++	//
++	// Fast captures are also paced by a mirror of the per-client PanelBudget: a capture is
++	// only requested once the link could send the previous keyframe's size in one go. Under
++	// sustained change the budget, not the capture rate, bounds keyframes/s; capturing
++	// faster than it drains would only make each frame older by the time its last byte left.
++	class CapturePolicy
++	{
++	public:
++		static constexpr uint64_t g_fastIntervalUs = 33333;		// ~30 captures/s
++		static constexpr uint64_t g_idleIntervalUs = 200000;	// 5/s, well inside the 750 ms deadline
++		static constexpr uint64_t g_holdFastUs = 600000;		// decay to idle after this long without activity
++		static constexpr uint64_t g_captureLeadUs = 10000;		// request -> published keyframe (render + encode)
++		static constexpr int g_fastTimerMs = 5;
++		static constexpr int g_idleTimerMs = 20;
++
++		static double wireBytes(const size_t _png)
++		{
++			return static_cast<double>(_png + 41 * ((_png + 16383) / 16384));
++		}
++
++		void activity(const uint64_t _nowUs) { m_lastActivityUs = _nowUs; m_haveActivity = true; }
++		void setTouchActive(const bool _active) { m_touchActive = _active; }
++
++		// A keyframe (or several, summed) was published for sending.
++		void keyframePublished(const uint64_t _nowUs, const size_t _pngBytes, const size_t _lastPngBytes)
++		{
++			refill(_nowUs);
++			m_tokens -= wireBytes(_pngBytes);
++			m_lastWireBytes = wireBytes(_lastPngBytes);
++		}
++
++		bool isFast(const uint64_t _nowUs) const
++		{
++			return m_touchActive || (m_haveActivity && _nowUs - m_lastActivityUs < g_holdFastUs);
++		}
++
++		uint64_t intervalUs(const uint64_t _nowUs) const { return isFast(_nowUs) ? g_fastIntervalUs : g_idleIntervalUs; }
++		int timerMs(const uint64_t _nowUs) const { return isFast(_nowUs) ? g_fastTimerMs : g_idleTimerMs; }
++
++		// True when a capture should be requested now; records the request time.
++		bool due(const uint64_t _nowUs)
++		{
++			if(m_haveCapture)
++			{
++				const auto elapsed = _nowUs - m_lastCaptureUs;
++				if(elapsed < intervalUs(_nowUs))
++					return false;
++				// The budget can delay a capture, but never past the idle interval.
++				refill(_nowUs);
++				if(elapsed < g_idleIntervalUs
++					&& m_tokens + g_captureLeadUs * g_panelBudgetBytesPerUs < m_lastWireBytes)
++					return false;
++			}
++			m_lastCaptureUs = _nowUs;
++			m_haveCapture = true;
++			return true;
++		}
++
++	private:
++		void refill(const uint64_t _nowUs)
++		{
++			if(m_haveRefill && _nowUs > m_lastRefillUs)
++				m_tokens = std::min(g_panelBudgetBurst, m_tokens + static_cast<double>(_nowUs - m_lastRefillUs) * g_panelBudgetBytesPerUs);
++			m_lastRefillUs = _nowUs;
++			m_haveRefill = true;
++		}
++
++		uint64_t m_lastActivityUs = 0;
++		uint64_t m_lastCaptureUs = 0;
++		uint64_t m_lastRefillUs = 0;
++		double m_tokens = g_panelBudgetBurst;
++		double m_lastWireBytes = 0;
++		bool m_haveActivity = false;
++		bool m_haveCapture = false;
++		bool m_haveRefill = false;
++		bool m_touchActive = false;
++	};
++}
+diff --git a/source/elektron/md/mdJucePlugin/mdRemotePanelPngTest.cpp b/source/elektron/md/mdJucePlugin/mdRemotePanelPngTest.cpp
+new file mode 100644
+index 00000000..24cefa24
+--- /dev/null
++++ b/source/elektron/md/mdJucePlugin/mdRemotePanelPngTest.cpp
+@@ -0,0 +1,456 @@
++// Remote panel v3 per-frame cost: correctness of the panel PNG writer, the pixel dedup and
++// the adaptive capture policy, plus a micro-benchmark of the worker's per-capture work
++// before (juce::PNGImageFormat on every capture) and after (pixel compare, then the panel
++// writer only for changed pixels).
++//
++// Usage: mdRemotePanelPngTest [captured keyframe .png ...]
++// Without arguments a synthetic panel-like raster is used. Real keyframes can be saved by
++// any passive v3 viewer; they are panel pixels, never firmware.
++
++#include "mdRemotePanelPng.h"
++#include "mdRemotePanelCapturePolicy.h"
++#include "mdRemotePanelWire.h"
++
++#include <algorithm>
++#include <chrono>
++#include <cstdio>
++#include <functional>
++#include <random>
++#include <string>
++#include <vector>
++
++using namespace mdJucePlugin::remotePanel;
++
++namespace
++{
++	int g_failures = 0;
++
++	void check(const bool _ok, const std::string& _what)
++	{
++		std::printf("%s %s\n", _ok ? "PASS" : "FAIL", _what.c_str());
++		if(!_ok)
++			++g_failures;
++	}
++
++	struct Stats
++	{
++		double median = 0, p95 = 0, mean = 0;
++	};
++
++	Stats stats(std::vector<double> _v)
++	{
++		Stats s;
++		if(_v.empty())
++			return s;
++		std::sort(_v.begin(), _v.end());
++		s.median = _v[_v.size() / 2];
++		s.p95 = _v[std::min(_v.size() - 1, _v.size() * 95 / 100)];
++		for(const auto v : _v)
++			s.mean += v;
++		s.mean /= static_cast<double>(_v.size());
++		return s;
++	}
++
++	Stats timeMs(const int _iterations, const std::function<void()>& _f)
++	{
++		std::vector<double> ms;
++		_f();	// warm-up
++		for(int i = 0; i < _iterations; ++i)
++		{
++			const auto t0 = std::chrono::steady_clock::now();
++			_f();
++			ms.push_back(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
++		}
++		return stats(ms);
++	}
++
++	std::vector<uint8_t> juceEncode(const juce::Image& _image)
++	{
++		juce::MemoryOutputStream out;
++		juce::PNGImageFormat().writeImageToStream(_image, out);
++		const auto* b = static_cast<const uint8_t*>(out.getData());
++		return {b, b + out.getDataSize()};
++	}
++
++	juce::Image decode(const std::vector<uint8_t>& _png)
++	{
++		juce::MemoryInputStream in(_png.data(), _png.size(), false);
++		return juce::PNGImageFormat().decodeImage(in);
++	}
++
++	// Compares straight-alpha colours; fully transparent pixels compare as equal.
++	bool sameColours(const juce::Image& _a, const juce::Image& _b)
++	{
++		if(_a.getWidth() != _b.getWidth() || _a.getHeight() != _b.getHeight())
++			return false;
++		for(int y = 0; y < _a.getHeight(); ++y)
++			for(int x = 0; x < _a.getWidth(); ++x)
++			{
++				const auto a = _a.getPixelAt(x, y), b = _b.getPixelAt(x, y);
++				if(a.getAlpha() != b.getAlpha())
++					return false;
++				if(a.getAlpha() && a.getARGB() != b.getARGB())
++					return false;
++			}
++		return true;
++	}
++
++	juce::Image syntheticPanel(const int _w, const int _h, const bool _opaque)
++	{
++		juce::Image img(juce::Image::ARGB, _w, _h, true);
++		juce::Graphics g(img);
++		if(_opaque)
++			g.fillAll(juce::Colour(0xff2b2d30));
++		g.setGradientFill(juce::ColourGradient(juce::Colour(0xff40444a), 0, 0, juce::Colour(0xff1c1d20), 0, static_cast<float>(_h), false));
++		g.fillRect(0, 0, _w, _h / 3);
++		std::mt19937 rng(7);
++		for(int i = 0; i < 120; ++i)
++		{
++			const auto x = static_cast<float>(rng() % _w), y = static_cast<float>(rng() % _h);
++			g.setColour(juce::Colour(0xff000000 | (rng() & 0xffffff)).withAlpha(_opaque ? 1.0f : 0.6f));
++			g.fillEllipse(x, y, 22, 22);
++			g.setColour(juce::Colours::white);
++			g.drawText("FUNC", juce::Rectangle<float>(x, y + 24, 40, 12), juce::Justification::centred);
++		}
++		return img;
++	}
++
++	void testCodec(const juce::Image& _src, const std::string& _name)
++	{
++		std::vector<uint8_t> png;
++		check(encodePanelPng(_src, png), _name + ": panel writer encodes");
++		const auto decoded = decode(png);
++		check(!decoded.isNull(), _name + ": juce decodes panel PNG");
++		const auto reference = decode(juceEncode(_src));
++		check(sameColours(decoded, reference), _name + ": decoded pixels identical to juce::PNGImageFormat round trip");
++	}
++
++	void testDedup(const juce::Image& _src)
++	{
++		auto copy = _src.createCopy();
++		check(samePixels(_src, copy), "dedup: identical copy compares equal");
++		copy.setPixelAt(copy.getWidth() - 1, copy.getHeight() - 1, juce::Colour(0xff123456));
++		check(!samePixels(_src, copy), "dedup: one changed pixel (last pixel) compares different");
++		copy = _src.createCopy();
++		copy.setPixelAt(0, 0, _src.getPixelAt(0, 0).withRotatedHue(0.5f).withAlpha(1.0f).withMultipliedBrightness(0.5f));
++		check(!samePixels(_src, copy), "dedup: one changed pixel (first pixel) compares different");
++		check(!samePixels(_src, _src.rescaled(_src.getWidth() / 2, _src.getHeight() / 2)), "dedup: different size compares different");
++	}
++
++	void testPolicy()
++	{
++		CapturePolicy p;
++		uint64_t t = 1000000;
++		int captures = 0;
++		// 30 s idle on the idle timer: ~5 captures/s and never fast.
++		bool everFast = false;
++		for(uint64_t end = t + 30000000; t < end; t += CapturePolicy::g_idleTimerMs * 1000)
++		{
++			everFast |= p.isFast(t);
++			captures += p.due(t);
++		}
++		check(!everFast && captures >= 145 && captures <= 151, "policy: idle 30 s -> " + std::to_string(captures) + " captures, never fast");
++
++		// Activity: next fast-timer tick captures immediately, then ~30/s.
++		p.activity(t);
++		check(p.isFast(t) && p.timerMs(t) == CapturePolicy::g_fastTimerMs, "policy: activity switches to fast");
++		check(p.due(t), "policy: first tick after activity captures immediately");
++		captures = 1;
++		const auto start = t;
++		for(t += 5000; t < start + 1000000; t += CapturePolicy::g_fastTimerMs * 1000)
++		{
++			if(t - start < 500000)
++				p.activity(t);	// keep changing for 0.5 s
++			captures += p.due(t);
++		}
++		// 0.5 s changing + 0.6 s hold window -> fast for the whole first second.
++		check(captures >= 27 && captures <= 30, "policy: changing panel -> " + std::to_string(captures) + " captures in 1 s (fast)");
++		// Decay: 0.6 s after the last activity the policy is idle again.
++		check(!p.isFast(start + 500000 + CapturePolicy::g_holdFastUs), "policy: decays to idle 600 ms after last activity");
++
++		// A held finger keeps fast cadence without further activity.
++		p.setTouchActive(true);
++		check(p.isFast(t + 10000000), "policy: touch active keeps fast cadence");
++		p.setTouchActive(false);
++		check(!p.isFast(t + 10000000), "policy: touch released and no activity -> idle");
++
++		// Budget pacing: sustained change with ~81 kB keyframes published right after each
++		// capture settles at the budget's keyframe rate, never exceeds the idle gap.
++		{
++			CapturePolicy q;
++			const size_t bytes = 81000;
++			int n = 0;
++			uint64_t last = 0, maxGap = 0;
++			for(uint64_t u = 1000000; u < 11000000; u += CapturePolicy::g_fastTimerMs * 1000)
++			{
++				q.activity(u);
++				if(!q.due(u))
++					continue;
++				if(last)
++					maxGap = std::max(maxGap, u - last);
++				last = u;
++				++n;
++				q.keyframePublished(u + CapturePolicy::g_captureLeadUs, bytes, bytes);
++			}
++			const double budgetRate = 10.0 * 1000000.0 * g_panelBudgetBytesPerUs / CapturePolicy::wireBytes(bytes);
++			check(n <= budgetRate + 4 && n >= budgetRate * 0.9 && maxGap < CapturePolicy::g_idleIntervalUs,
++				"policy: budget-paced sustained change -> " + std::to_string(n) + " captures in 10 s (budget allows "
++				+ std::to_string(static_cast<int>(budgetRate)) + "), max gap " + std::to_string(maxGap / 1000) + " ms");
++		}
++
++		// Every idle interval stays inside the viewer's 750 ms freshness deadline.
++		check(CapturePolicy::g_idleIntervalUs + CapturePolicy::g_idleTimerMs * 1000 < 750000, "policy: idle interval + timer slack < 750 ms freshness deadline");
++	}
++
++	// Idle honesty: with a viewer attached and nothing changing for 30 s, the worker's
++	// dedup must produce zero PanelChunk bytes.
++	void testIdleBytes(const juce::Image& _src)
++	{
++		CapturePolicy p;
++		juce::Image last;
++		size_t bytes = 0;
++		int encodes = 0, captures = 0;
++		// The first keyframe after subscribe is expected; count from after it.
++		last = _src.createCopy();
++		for(uint64_t t = 0; t < 30000000; t += CapturePolicy::g_idleTimerMs * 1000)
++		{
++			if(!p.due(t))
++				continue;
++			++captures;
++			const auto capture = _src.createCopy();
++			if(samePixels(capture, last))
++				continue;
++			std::vector<uint8_t> png;
++			encodePanelPng(capture, png);
++			++encodes;
++			bytes += png.size();
++			last = capture;
++		}
++		check(bytes == 0 && encodes == 0, "idle 30 s: " + std::to_string(captures) + " captures, " + std::to_string(encodes)
++			+ " encodes, " + std::to_string(bytes) + " PanelChunk bytes");
++	}
++
++	// Time for one keyframe of _bytes to clear the per-client PanelBudget, starting from a
++	// quiet link (full burst credit), sending 16384-byte chunks + 41-byte headers.
++	double budgetTransferMs(const size_t _bytes)
++	{
++		PanelBudget b;
++		uint64_t t = 1;
++		b.consume(t, 0);
++		t += 1000000;	// quiet: credit refilled to cap
++		size_t off = 0;
++		const auto start = t;
++		while(off < _bytes)
++		{
++			const auto n = std::min<size_t>(16384, _bytes - off);
++			if(b.consume(t, n + 41))
++				off += n;
++			else
++				t += 100;
++		}
++		return static_cast<double>(t - start) / 1000.0;
++	}
++
++	// Host-side latency MODEL, not an end-to-end measurement: it composes the encode times
++	// measured above with the real capture cadence rules and the real token bucket. It
++	// excludes Rml render/readback (identical before/after, needs the live GPU context),
++	// Wi-Fi transit and iPad decode/display. 0.1 ms steps.
++	struct PathModel
++	{
++		bool adaptive;			// false: 20 ms timer, >= 66.667 ms between capture requests
++		double encodeMs;		// worker encode per changed capture
++		double workerPollMs;	// before: worker slept 5 ms between polls; after: woken directly
++		size_t bytes;			// keyframe size
++		double burst;			// token bucket cap
++	};
++
++	struct Budget
++	{
++		double tokens = 16384, burst;
++		explicit Budget(const double _burst) : burst(_burst) {}
++		void tick(const double _us) { tokens = std::min(burst, tokens + _us * g_panelBudgetBytesPerUs); }
++	};
++
++	// Single change after >= 2 s quiet. _touch: the change is a handled touch (after: the fast
++	// timer starts immediately); otherwise a firmware LED/LCD change seen at the next timer tick.
++	Stats modelSingleChange(const PathModel& _m, const bool _touch, const int _runs, Stats* _captureWait = nullptr)
++	{
++		std::mt19937 rng(11);
++		std::vector<double> out, wait;
++		for(int r = 0; r < _runs; ++r)
++		{
++			const double step = 0.1;
++			// Random phase of the timer and of the last idle capture relative to the change at t=0.
++			const double timerPhase = std::uniform_real_distribution<double>(0, 20)(rng);
++			double t = 0;
++			double captureAt = -1;
++			if(!_m.adaptive)
++			{
++				const double lastReq = timerPhase - 20.0 * std::uniform_int_distribution<int>(1, 4)(rng);	// idle cadence: every 4th 20 ms tick
++				for(double tick = timerPhase; captureAt < 0; tick += 20)
++					if(tick - lastReq >= 66.667) captureAt = tick;
++			}
++			else
++			{
++				CapturePolicy p;
++				const double lastReq = timerPhase - 20.0 * std::uniform_int_distribution<int>(1, 10)(rng);	// idle cadence: every 10th 20 ms tick
++				p.due(static_cast<uint64_t>((lastReq + 10000) * 1000));
++				double tick = _touch ? CapturePolicy::g_fastTimerMs : timerPhase;
++				for(; captureAt < 0; tick += p.timerMs(static_cast<uint64_t>((tick + 10000) * 1000)))
++				{
++					const auto us = static_cast<uint64_t>((tick + 10000) * 1000);
++					p.activity(us);
++					if(p.due(us)) captureAt = tick;
++				}
++			}
++			wait.push_back(captureAt);
++			t = captureAt + std::uniform_real_distribution<double>(0, _m.workerPollMs)(rng) + _m.encodeMs;
++			Budget b(_m.burst);
++			b.tokens = _m.burst;	// quiet link
++			size_t off = 0;
++			while(off < _m.bytes)
++			{
++				const auto n = std::min<size_t>(16384, _m.bytes - off);
++				if(b.tokens >= static_cast<double>(n + 41)) { b.tokens -= static_cast<double>(n + 41); off += n; }
++				else { b.tick(step * 1000); t += step; }
++			}
++			out.push_back(t);
++		}
++		if(_captureWait)
++			*_captureWait = stats(wait);
++		return stats(out);
++	}
++
++	// Sustained change (every capture differs), 20 s. Returns delivered keyframes/s and the
++	// age of each delivered keyframe (change captured -> last byte released).
++	std::pair<double, Stats> modelSustained(const PathModel& _m)
++	{
++		const double step = 0.1, end = 20000;
++		Budget b(_m.burst);
++		b.tokens = _m.burst;	// viewer connected a while ago: link quiet, credit full
++		CapturePolicy p;
++		double lastReq = -1e9, nextTick = 0, encodeDone = -1, pendingCapture = -1;
++		double newestReady = -1, sendingCapture = -1;
++		size_t sendingOff = 0;
++		bool sending = false;
++		int delivered = 0;
++		std::vector<double> age;
++		for(double t = 0; t < end; t += step)
++		{
++			b.tick(step * 1000);
++			if(t >= nextTick)
++			{
++				const auto us = static_cast<uint64_t>((t + 10000) * 1000);
++				bool due;
++				if(_m.adaptive) { p.activity(us); due = p.due(us); nextTick = t + p.timerMs(us); }
++				else { due = t - lastReq >= 66.667; if(due) lastReq = t; nextTick = t + 20; }
++				if(due && encodeDone < 0) { pendingCapture = t; encodeDone = t + _m.workerPollMs / 2 + _m.encodeMs; }
++			}
++			if(encodeDone >= 0 && t >= encodeDone)
++			{
++				newestReady = pendingCapture;
++				encodeDone = -1;
++				if(_m.adaptive)
++					p.keyframePublished(static_cast<uint64_t>((t + 10000) * 1000), _m.bytes, _m.bytes);
++			}
++			if(!sending && newestReady >= 0 && newestReady != sendingCapture) { sending = true; sendingCapture = newestReady; sendingOff = 0; }
++			if(sending)
++			{
++				const auto n = std::min<size_t>(16384, _m.bytes - sendingOff);
++				if(b.tokens >= static_cast<double>(n + 41))
++				{
++					b.tokens -= static_cast<double>(n + 41);
++					sendingOff += n;
++					if(sendingOff == _m.bytes) { sending = false; ++delivered; if(t > 2000) age.push_back(t - sendingCapture); }
++				}
++			}
++		}
++		return {delivered / (end / 1000.0), stats(age)};
++	}
++
++	void model(const double _oldEncodeMs, const size_t _oldBytes, const double _newEncodeMs, const size_t _newBytes)
++	{
++		const PathModel before{false, _oldEncodeMs, 5.0, _oldBytes, 32768};
++		const PathModel after{true, _newEncodeMs, 0.0, _newBytes, g_panelBudgetBurst};
++		std::printf("\nMODEL host-side change -> last PanelChunk byte released (ms median / p95 / mean)\n");
++		std::printf("  excludes render/readback, Wi-Fi, iPad decode; uses encode medians measured above\n");
++		for(const bool touch : {true, false})
++		{
++			Stats wa, wc;
++			const auto a = modelSingleChange(before, touch, 2000, &wa), c = modelSingleChange(after, touch, 2000, &wc);
++			const char* what = touch ? "touch (pressed state)" : "firmware LED/LCD";
++			std::printf("  single %-22s before %6.1f / %6.1f / %6.1f   after %6.1f / %6.1f / %6.1f\n",
++				what, a.median, a.p95, a.mean, c.median, c.p95, c.mean);
++			std::printf("    of which change -> capture request      before %6.1f / %6.1f / %6.1f   after %6.1f / %6.1f / %6.1f\n",
++				wa.median, wa.p95, wa.mean, wc.median, wc.p95, wc.mean);
++		}
++		const auto sb = modelSustained(before), sa = modelSustained(after);
++		std::printf("  sustained change: before %.1f keyframes/s, age %6.1f / %6.1f / %6.1f;  after %.1f keyframes/s, age %6.1f / %6.1f / %6.1f\n",
++			sb.first, sb.second.median, sb.second.p95, sb.second.mean, sa.first, sa.second.median, sa.second.p95, sa.second.mean);
++	}
++
++	void bench(const juce::Image& _src, const std::string& _name)
++	{
++		const int n = 60;
++		std::vector<uint8_t> png;
++		const auto oldBytes = juceEncode(_src).size();
++		encodePanelPng(_src, png);
++		const auto newBytes = png.size();
++		std::vector<uint8_t> png3;
++		encodePanelPng(_src, png3, {3});
++
++		const auto copy = _src.createCopy();
++		const auto tCopy = timeMs(n, [&] { (void)_src.createCopy(); });
++		const auto tOld = timeMs(n, [&] { (void)juceEncode(_src); });
++		const auto tNew = timeMs(n, [&] { encodePanelPng(_src, png); });
++		const auto tNew3 = timeMs(n, [&] { encodePanelPng(_src, png3, {3}); });
++		const auto tCmp = timeMs(n, [&] { (void)samePixels(_src, copy); });
++
++		std::printf("\nBENCH %s  %dx%d, %d iterations, ms median / p95 / mean\n", _name.c_str(), _src.getWidth(), _src.getHeight(), n);
++		std::printf("  callback createCopy                 %7.3f / %7.3f / %7.3f\n", tCopy.median, tCopy.p95, tCopy.mean);
++		std::printf("  BEFORE juce::PNGImageFormat (lvl 6)  %7.3f / %7.3f / %7.3f   %zu bytes\n", tOld.median, tOld.p95, tOld.mean, oldBytes);
++		std::printf("  AFTER  panel PNG zlib 3, Up (shipped) %7.3f / %7.3f / %7.3f   %zu bytes\n", tNew3.median, tNew3.p95, tNew3.mean, png3.size());
++		std::printf("  (alt)  panel PNG zlib 1, Up filter   %7.3f / %7.3f / %7.3f   %zu bytes\n", tNew.median, tNew.p95, tNew.mean, newBytes);
++		std::printf("  AFTER  unchanged-frame pixel compare %7.3f / %7.3f / %7.3f   0 bytes (encode skipped)\n", tCmp.median, tCmp.p95, tCmp.mean);
++		std::printf("  worker cost per CHANGED capture: before %.3f ms, after %.3f ms (compare + encode)\n", tOld.median, tCmp.median + tNew3.median);
++		std::printf("  worker cost per UNCHANGED capture: before %.3f ms, after %.3f ms\n", tOld.median, tCmp.median);
++		std::printf("  PanelBudget transfer of one keyframe from quiet link (current burst cap %.0f B): %.1f ms (%zu B, zlib 1), %.1f ms (%zu B, zlib 3)\n",
++			g_panelBudgetBurst, budgetTransferMs(newBytes), newBytes, budgetTransferMs(png3.size()), png3.size());
++		model(tOld.median, oldBytes, tNew3.median + tCmp.median, png3.size());
++	}
++}
++
++int main(int _argc, char** _argv)
++{
++	juce::ScopedJuceInitialiser_GUI juce;
++
++	std::vector<std::pair<std::string, juce::Image>> images;
++	for(int i = 1; i < _argc; ++i)
++	{
++		const juce::File f(juce::File::getCurrentWorkingDirectory().getChildFile(_argv[i]));
++		auto img = juce::ImageFileFormat::loadFrom(f);
++		if(img.isNull())
++		{
++			std::printf("FAIL cannot load %s\n", _argv[i]);
++			return 1;
++		}
++		// Screenshots arrive as ARGB; benchmark exactly that format.
++		images.emplace_back(f.getFileName().toStdString(), img.convertedToFormat(juce::Image::ARGB));
++	}
++	if(images.empty())
++		images.emplace_back("synthetic-1032x535", syntheticPanel(1032, 535, true));
++
++	for(const auto& [name, img] : images)
++		testCodec(img, name);
++	testCodec(syntheticPanel(320, 200, false), "synthetic translucent (RGBA fallback)");
++	testCodec(syntheticPanel(1032, 535, true).convertedToFormat(juce::Image::RGB), "synthetic RGB-format image");
++	testDedup(images.front().second);
++	testPolicy();
++	testIdleBytes(images.front().second);
++
++	for(const auto& [name, img] : images)
++		bench(img, name);
++
++	std::printf("\n%s: %d failure(s)\n", g_failures ? "FAILED" : "ALL PASSED", g_failures);
++	return g_failures ? 1 : 0;
++}
+diff --git a/doc/remote-panel-v3-latency.md b/doc/remote-panel-v3-latency.md
+new file mode 100644
+index 00000000..df65b521
+--- /dev/null
++++ b/doc/remote-panel-v3-latency.md
+@@ -0,0 +1,101 @@
++# Remote panel v3: latency work (2026-09-27)
++
++Goal: reduce felt latency of the v3 streamed panel without touching audio, without changing
++the wire byte layout, and without giving up "idle viewer ⇒ zero PanelChunk bytes".
++
++Constraint during this work: a live host (PID 91725) was in use from the iPad. It was never
++killed, restarted or signalled. **No live end-to-end number in this document was measured on
++the new code; every end-to-end figure is DEFERRED until the user restarts the host.**
++
++## What the code actually cost (read before choosing)
++
++Per capture, `mdRemotePanelV3.cpp` did: Rml render + GPU readback + swizzle (message thread),
++`createCopy` in the callback, then on the worker `juce::PNGImageFormat` (libpng defaults: zlib
++level 6, adaptive filters, RGBA with a per-pixel unpremultiply) on **every** capture, and only
++then compared PNG bytes to drop duplicates. Captures ran every 66.7 ms on a 20 ms timer, i.e.
++every fourth tick = 80 ms = 12.5/s, which matches the measured ~12 frames/s. The worker also
++slept 5 ms between polls. Separately, the per-client `PanelBudget` (1.25 MB/s, 32 KiB burst)
++needs ~37 ms to release one ~79 kB keyframe even on a quiet link.
++
++## What changed
++
++1. **Pixel dedup before encode** (`samePixels`, worker). A capture equal to the live keyframe
++   is dropped after a ~0.1 ms compare instead of a ~33 ms encode. Same "no bytes when equal"
++   behaviour as before, now decided on pixels rather than on PNG bytes.
++2. **Panel PNG writer** (`mdRemotePanelPng.{h,cpp}`, JUCE's zlib, no new dependency). Ordinary
++   lossless PNG: RGB8 when every pixel is opaque (no unpremultiply), else RGBA8 unpremultiplied
++   exactly like JUCE; Up-filtered rows; zlib level 3. Decoded pixels are identical to the JUCE
++   writer's round trip (tested on three real keyframes, a translucent and an RGB-format image).
++   Chosen over a smaller raster (visible quality loss on the iPad) and over a wire change
++   (dirty rectangles would need a new client contract). Level 3 instead of 1: +0.8 ms encode
++   for −3 kB per keyframe.
++3. **Adaptive cadence** (`mdRemotePanelCapturePolicy.h`, message thread). Idle: one capture
++   per 200 ms on a 20 ms timer (inside the 750 ms freshness deadline with margin). Fast: ≤ one
++   per 33 ms on a 5 ms timer while a Touch is down, after a handled Touch (the timer is switched
++   to 5 ms immediately), after an LCD/LED *content* change seen by the pump, or after the
++   worker published changed pixels; decays to idle 600 ms after the last signal. The editor's
++   LED publication sequence is **not** used: it counts LED bank writes, not changes.
++4. **Budget-aware pacing + burst.** At 30 captures/s × ~81 kB the unchanged 1.25 MB/s budget
++   would make every frame trickle out (the model showed frame age *rising* 72 → 88 ms). So:
++   the policy mirrors the budget and only requests a fast capture once the previous
++   keyframe's size could leave in one go; and the burst cap is raised 32 KiB → 128 KiB (one
++   whole keyframe). **The sustained rate is unchanged at 1.25 MB/s**, so the average Wi-Fi load
++   ceiling is the one already verified with the iPad.
++5. The worker is woken by a condition variable from the screenshot callback instead of
++   polling every 5 ms.
++
++Threads: capture/encode stay off the audio thread (message thread + worker, as before). Touch
++handling does not wait on capture: it only records activity and restarts the timer.
++
++Wire: **no byte layout change.** `panel3.js` decodes any PNG via `createImageBitmap`/`Image`
++and was not modified. `doc/remote-panel-v3.md` text updated for cadence, PNG form and burst.
++
++## Measured (standalone harness, real keyframes, host untouched)
++
++`mdRemotePanelPngTest` on three 1032×535 keyframes captured passively from the live host
++(receive-only viewer: Hello 3, no PanelReady, no Touch; `tools/remote-panel-v3/passive_grab.py`).
++Full output: `tools/remote-panel-v3/latency-evidence/bench-final.txt`. Frame00, ms median / p95:
++
++| Worker work per capture | Before | After |
++|---|---:|---:|
++| Changed pixels (encode) | 32.6 / 44.8 (78 654 B) | 5.8 compare+encode (80 999 B) |
++| Unchanged pixels | 32.6 (encode, then dropped) | 0.09 (compare only) |
++| Callback `createCopy` (unchanged) | 0.19 | 0.19 |
++
++Other frames agree within ~1 ms. Idle-bytes check (policy + dedup over 30 s of identical
++captures): 150 captures, 0 encodes, **0 PanelChunk bytes**.
++
++## Modelled, not measured end-to-end
++
++The harness composes the measured encode medians with the real `CapturePolicy`, the old
++cadence rule and the token bucket. It **excludes** render/readback, Wi-Fi and iPad decode.
++
++| Host-side change → last PanelChunk byte released (ms, median / p95) | Before | After |
++|---|---:|---:|
++| Touch (pressed state), single change after quiet | 111 / 148 | 11 / 31 |
++| — of which change → capture request | 39 / 76 | 5 / 25 |
++| Firmware LCD/LED change, single | 111 / 148 | 17 / 31 |
++| Sustained change: keyframes/s, frame age | 12.5/s, 72 | 15.5/s, 8 |
++
++Under sustained change the 1.25 MB/s budget, not the 30/s capture target, bounds delivered
++keyframes to ~15/s at ~81 kB each. 25–30/s delivered would need ~2.4 MB/s; raising the
++sustained rate is the next lever and needs a Wi-Fi measurement with the iPad first.
++
++## Build
++
++`cmake --build build/macos-md-arm64 --target mdJucePlugin_Standalone -j 8` (run under
++`taskpolicy -b nice -n 20` so it could not compete with the live audio) → `[100%] Built target
++mdJucePlugin_Standalone`, exit 0. Before building, the running host's executable (inode
++79599516) was **renamed** to `build/macos-md-arm64/live-host-91725-Gearmulator-MD.bin` and a
++copy put in the bundle, so the linker/codesign could never write the mapped file; `lsof`
++after the build shows PID 91725 still on inode 79599516. Delete that file after the host exits.
++
++## Unverified / deferred
++
++- Live press-to-displayed-frame on the iPad with the new build (needs a host restart).
++- Live CPU at block 128/512 with a viewer. Expected lower at idle (5 vs 12.5 captures/s, no
++  idle encodes) and in fast mode per frame, but render + GPU readback per capture was not
++  measured (needs the live GPU context) and fast mode can request up to ~28 captures/s.
++- The 30 s zero-bytes property on the live host (the harness proves the logic only).
++- Whether the 128 KiB burst causes ack delay on a weak Wi-Fi link (sustained rate unchanged).
++- Render wait between a capture request and the screenshot callback (≤ one Rml frame).
+diff --git a/tools/remote-panel-v3/passive_grab.py b/tools/remote-panel-v3/passive_grab.py
+new file mode 100644
+index 00000000..292289db
+--- /dev/null
++++ b/tools/remote-panel-v3/passive_grab.py
+@@ -0,0 +1,35 @@
++# Passive v3 viewer: Hello 3, collect keyframes, never sends PanelReady/Touch.
++import socket, os, base64, struct, sys, time
++port=int(sys.argv[1]); out=sys.argv[2]; dur=float(sys.argv[3])
++s=socket.create_connection(('127.0.0.1',port)); key=base64.b64encode(os.urandom(16)).decode()
++s.sendall(f"GET / HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n".encode())
++buf=b''
++while b'\r\n\r\n' not in buf: buf+=s.recv(4096)
++buf=buf.split(b'\r\n\r\n',1)[1]
++def send(p):
++    m=os.urandom(4); s.sendall(bytes([0x82,0x80|len(p)])+m+bytes(b^m[i%4] for i,b in enumerate(p)))
++def need(n):
++    global buf
++    while len(buf)<n:
++        d=s.recv(65536)
++        if not d: raise EOFError
++        buf+=d
++def msg():
++    global buf
++    need(2); b1=buf[1]&127; o=2
++    if b1==126: need(4); b1=struct.unpack('>H',buf[2:4])[0]; o=4
++    elif b1==127: need(10); b1=struct.unpack('>Q',buf[2:10])[0]; o=10
++    need(o+b1); p=buf[o:o+b1]; op=buf[0]&15; buf=buf[o+b1:]; return op,p
++send(b'\x01\x03'); s.settimeout(1.0)
++end=time.time()+dur; pend={}; n=0
++while time.time()<end:
++    try: op,p=msg()
++    except socket.timeout: continue
++    if op!=2 or not p: continue
++    if p[0]==0x84: print('source',p[1],p[2],struct.unpack('<9I',p[3:39])[-2:] if p[1] else '')
++    if p[0]==0x85:
++        gen,seq,led,us,tot,off,cnt=struct.unpack('<IQQQIII',p[1:41])
++        b=pend.setdefault(seq,bytearray()); b+=p[41:41+cnt]
++        if len(b)==tot:
++            open(f'{out}/frame{n:02d}_seq{seq}.png','wb').write(b); n+=1; print('frame',seq,tot); del pend[seq]
++s.close()
+diff --git a/tools/remote-panel-v3/latency-evidence/bench-final.txt b/tools/remote-panel-v3/latency-evidence/bench-final.txt
+new file mode 100644
+index 00000000..859a2467
+--- /dev/null
++++ b/tools/remote-panel-v3/latency-evidence/bench-final.txt
+@@ -0,0 +1,85 @@
++PASS frame00_seq16386.png: panel writer encodes
++PASS frame00_seq16386.png: juce decodes panel PNG
++PASS frame00_seq16386.png: decoded pixels identical to juce::PNGImageFormat round trip
++PASS frame01_seq16391.png: panel writer encodes
++PASS frame01_seq16391.png: juce decodes panel PNG
++PASS frame01_seq16391.png: decoded pixels identical to juce::PNGImageFormat round trip
++PASS frame11_seq16418.png: panel writer encodes
++PASS frame11_seq16418.png: juce decodes panel PNG
++PASS frame11_seq16418.png: decoded pixels identical to juce::PNGImageFormat round trip
++PASS synthetic translucent (RGBA fallback): panel writer encodes
++PASS synthetic translucent (RGBA fallback): juce decodes panel PNG
++PASS synthetic translucent (RGBA fallback): decoded pixels identical to juce::PNGImageFormat round trip
++PASS synthetic RGB-format image: panel writer encodes
++PASS synthetic RGB-format image: juce decodes panel PNG
++PASS synthetic RGB-format image: decoded pixels identical to juce::PNGImageFormat round trip
++PASS dedup: identical copy compares equal
++PASS dedup: one changed pixel (last pixel) compares different
++PASS dedup: one changed pixel (first pixel) compares different
++PASS dedup: different size compares different
++PASS policy: idle 30 s -> 150 captures, never fast
++PASS policy: activity switches to fast
++PASS policy: first tick after activity captures immediately
++PASS policy: changing panel -> 29 captures in 1 s (fast)
++PASS policy: decays to idle 600 ms after last activity
++PASS policy: touch active keeps fast cadence
++PASS policy: touch released and no activity -> idle
++PASS policy: budget-paced sustained change -> 155 captures in 10 s (budget allows 153), max gap 65 ms
++PASS policy: idle interval + timer slack < 750 ms freshness deadline
++PASS idle 30 s: 150 captures, 0 encodes, 0 PanelChunk bytes
++
++BENCH frame00_seq16386.png  1032x535, 60 iterations, ms median / p95 / mean
++  callback createCopy                   0.191 /   0.368 /   0.230
++  BEFORE juce::PNGImageFormat (lvl 6)   32.560 /  44.816 /  33.135   78654 bytes
++  AFTER  panel PNG zlib 3, Up (shipped)   5.699 /   6.648 /   5.849   80999 bytes
++  (alt)  panel PNG zlib 1, Up filter     4.906 /   5.758 /   5.003   83893 bytes
++  AFTER  unchanged-frame pixel compare   0.091 /   0.149 /   0.104   0 bytes (encode skipped)
++  worker cost per CHANGED capture: before 32.560 ms, after 5.790 ms (compare + encode)
++  worker cost per UNCHANGED capture: before 32.560 ms, after 0.091 ms
++  PanelBudget transfer of one keyframe from quiet link (current burst cap 131072 B): 0.0 ms (83893 B, zlib 1), 0.0 ms (80999 B, zlib 3)
++
++MODEL host-side change -> last PanelChunk byte released (ms median / p95 / mean)
++  excludes render/readback, Wi-Fi, iPad decode; uses encode medians measured above
++  single touch (pressed state)  before  111.2 /  147.9 /  111.7   after   10.8 /   30.8 /   13.3
++    of which change -> capture request      before   39.3 /   76.1 /   39.8   after    5.0 /   25.0 /    7.5
++  single firmware LED/LCD       before  111.2 /  147.9 /  111.7   after   17.1 /   31.0 /   17.4
++    of which change -> capture request      before   39.3 /   76.1 /   39.8   after   11.3 /   25.2 /   11.6
++  sustained change: before 12.5 keyframes/s, age   72.0 /   72.0 /   72.0;  after 15.5 keyframes/s, age    7.8 /    9.7 /    7.8
++
++BENCH frame01_seq16391.png  1032x535, 60 iterations, ms median / p95 / mean
++  callback createCopy                   0.185 /   0.369 /   0.204
++  BEFORE juce::PNGImageFormat (lvl 6)   33.198 /  58.036 /  36.195   78653 bytes
++  AFTER  panel PNG zlib 3, Up (shipped)   5.889 /   9.765 /   6.280   80968 bytes
++  (alt)  panel PNG zlib 1, Up filter     4.874 /   5.572 /   5.004   83892 bytes
++  AFTER  unchanged-frame pixel compare   0.104 /   0.148 /   0.110   0 bytes (encode skipped)
++  worker cost per CHANGED capture: before 33.198 ms, after 5.994 ms (compare + encode)
++  worker cost per UNCHANGED capture: before 33.198 ms, after 0.104 ms
++  PanelBudget transfer of one keyframe from quiet link (current burst cap 131072 B): 0.0 ms (83892 B, zlib 1), 0.0 ms (80968 B, zlib 3)
++
++MODEL host-side change -> last PanelChunk byte released (ms median / p95 / mean)
++  excludes render/readback, Wi-Fi, iPad decode; uses encode medians measured above
++  single touch (pressed state)  before  111.8 /  148.5 /  112.4   after   11.0 /   31.0 /   13.5
++    of which change -> capture request      before   39.3 /   76.1 /   39.8   after    5.0 /   25.0 /    7.5
++  single firmware LED/LCD       before  111.8 /  148.5 /  112.4   after   17.3 /   31.2 /   17.6
++    of which change -> capture request      before   39.3 /   76.1 /   39.8   after   11.3 /   25.2 /   11.6
++  sustained change: before 12.5 keyframes/s, age   72.6 /   72.6 /   72.6;  after 15.5 keyframes/s, age    7.4 /    9.8 /    7.7
++
++BENCH frame11_seq16418.png  1032x535, 60 iterations, ms median / p95 / mean
++  callback createCopy                   0.175 /   0.287 /   0.192
++  BEFORE juce::PNGImageFormat (lvl 6)   32.525 /  52.623 /  34.296   78663 bytes
++  AFTER  panel PNG zlib 3, Up (shipped)   5.506 /   6.590 /   5.658   81010 bytes
++  (alt)  panel PNG zlib 1, Up filter     4.943 /   5.727 /   5.024   83903 bytes
++  AFTER  unchanged-frame pixel compare   0.090 /   0.092 /   0.091   0 bytes (encode skipped)
++  worker cost per CHANGED capture: before 32.525 ms, after 5.596 ms (compare + encode)
++  worker cost per UNCHANGED capture: before 32.525 ms, after 0.090 ms
++  PanelBudget transfer of one keyframe from quiet link (current burst cap 131072 B): 0.0 ms (83903 B, zlib 1), 0.0 ms (81010 B, zlib 3)
++
++MODEL host-side change -> last PanelChunk byte released (ms median / p95 / mean)
++  excludes render/readback, Wi-Fi, iPad decode; uses encode medians measured above
++  single touch (pressed state)  before  111.1 /  147.8 /  111.7   after   10.6 /   30.6 /   13.1
++    of which change -> capture request      before   39.3 /   76.1 /   39.8   after    5.0 /   25.0 /    7.5
++  single firmware LED/LCD       before  111.1 /  147.8 /  111.7   after   16.9 /   30.8 /   17.2
++    of which change -> capture request      before   39.3 /   76.1 /   39.8   after   11.3 /   25.2 /   11.6
++  sustained change: before 12.5 keyframes/s, age   72.0 /   72.0 /   72.0;  after 15.5 keyframes/s, age    7.6 /    9.7 /    7.7
++
++ALL PASSED: 0 failure(s)
+diff --git a/tools/remote-panel-v3/latency-evidence/bench-synthetic.txt b/tools/remote-panel-v3/latency-evidence/bench-synthetic.txt
+new file mode 100644
+index 00000000..069f5159
+--- /dev/null
++++ b/tools/remote-panel-v3/latency-evidence/bench-synthetic.txt
+@@ -0,0 +1,43 @@
++PASS synthetic-1032x535: panel writer encodes
++PASS synthetic-1032x535: juce decodes panel PNG
++PASS synthetic-1032x535: decoded pixels identical to juce::PNGImageFormat round trip
++PASS synthetic translucent (RGBA fallback): panel writer encodes
++PASS synthetic translucent (RGBA fallback): juce decodes panel PNG
++PASS synthetic translucent (RGBA fallback): decoded pixels identical to juce::PNGImageFormat round trip
++PASS synthetic RGB-format image: panel writer encodes
++PASS synthetic RGB-format image: juce decodes panel PNG
++PASS synthetic RGB-format image: decoded pixels identical to juce::PNGImageFormat round trip
++PASS dedup: identical copy compares equal
++PASS dedup: one changed pixel (last pixel) compares different
++PASS dedup: one changed pixel (first pixel) compares different
++PASS dedup: different size compares different
++PASS policy: idle 30 s -> 150 captures, never fast
++PASS policy: activity switches to fast
++PASS policy: first tick after activity captures immediately
++PASS policy: changing panel -> 29 captures in 1 s (fast)
++PASS policy: decays to idle 600 ms after last activity
++PASS policy: touch active keeps fast cadence
++PASS policy: touch released and no activity -> idle
++PASS policy: budget-paced sustained change -> 155 captures in 10 s (budget allows 153), max gap 65 ms
++PASS policy: idle interval + timer slack < 750 ms freshness deadline
++PASS idle 30 s: 150 captures, 0 encodes, 0 PanelChunk bytes
++
++BENCH synthetic-1032x535  1032x535, 60 iterations, ms median / p95 / mean
++  callback createCopy                   0.217 /   0.462 /   0.257
++  BEFORE juce::PNGImageFormat (lvl 6)   42.389 /  70.285 /  46.685   117391 bytes
++  AFTER  panel PNG zlib 3, Up (shipped)   8.025 /   9.023 /   8.051   111287 bytes
++  (alt)  panel PNG zlib 1, Up filter     6.624 /   7.680 /   6.871   126917 bytes
++  AFTER  unchanged-frame pixel compare   0.089 /   0.091 /   0.089   0 bytes (encode skipped)
++  worker cost per CHANGED capture: before 42.389 ms, after 8.114 ms (compare + encode)
++  worker cost per UNCHANGED capture: before 42.389 ms, after 0.089 ms
++  PanelBudget transfer of one keyframe from quiet link (current burst cap 131072 B): 0.0 ms (126917 B, zlib 1), 0.0 ms (111287 B, zlib 3)
++
++MODEL host-side change -> last PanelChunk byte released (ms median / p95 / mean)
++  excludes render/readback, Wi-Fi, iPad decode; uses encode medians measured above
++  single touch (pressed state)  before  152.1 /  188.8 /  152.7   after   13.1 /   33.1 /   15.6
++    of which change -> capture request      before   39.3 /   76.1 /   39.8   after    5.0 /   25.0 /    7.5
++  single firmware LED/LCD       before  152.1 /  188.8 /  152.7   after   19.4 /   33.3 /   19.7
++    of which change -> capture request      before   39.3 /   76.1 /   39.8   after   11.3 /   25.2 /   11.6
++  sustained change: before 10.6 keyframes/s, age  179.4 /  214.8 /  179.0;  after 11.2 keyframes/s, age    8.8 /    9.6 /    9.0
++
++ALL PASSED: 0 failure(s)
+diff --git a/tools/remote-panel-v3/latency-evidence/standalone-build-tail.txt b/tools/remote-panel-v3/latency-evidence/standalone-build-tail.txt
+new file mode 100644
+index 00000000..59fcbf3a
+--- /dev/null
++++ b/tools/remote-panel-v3/latency-evidence/standalone-build-tail.txt
+@@ -0,0 +1,5 @@
++ld: warning: reducing alignment of section __DATA,__common from 0x8000 to 0x4000 because it exceeds segment maximum alignment
++Ad-hoc signing completed mdJucePlugin_Standalone bundle
++/Users/michaelmeneses/gearmulator-md-mm/build/macos-md-arm64/products/Release/Standalone/Gearmulator MD.app: replacing existing signature
++[100%] Built target mdJucePlugin_Standalone
++taskpolicy -b nice -n 20 cmake --build build/macos-md-arm64 --target  -j 8  83.80s user 27.27s system 159% cpu 1:09.72 total
+diff --git a/tools/remote-panel-v3/latency-evidence/wire-test.txt b/tools/remote-panel-v3/latency-evidence/wire-test.txt
+new file mode 100644
+index 00000000..a2b63314
+--- /dev/null
++++ b/tools/remote-panel-v3/latency-evidence/wire-test.txt
+@@ -0,0 +1,3 @@
++PASS production RowOwners: same-control refs 1/2/1/0, different bits, aliases, desktop merge, unmatched release
++PASS Touch: LE layout, phases, short/oversize, NaN/Inf, coordinate bounds (-ffast-math)
++PASS PanelBudget: simulated 1 s bytes=1264725 burst<=131072 (one whole keyframe), rejects 2 MiB

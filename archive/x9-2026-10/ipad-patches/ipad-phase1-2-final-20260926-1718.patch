@@ -1,0 +1,1230 @@
+diff --git a/source/elektron/md/mdJucePlugin/CMakeLists.txt b/source/elektron/md/mdJucePlugin/CMakeLists.txt
+index 31ea18d2..c18a2dc0 100644
+--- a/source/elektron/md/mdJucePlugin/CMakeLists.txt
++++ b/source/elektron/md/mdJucePlugin/CMakeLists.txt
+@@ -68,9 +68,27 @@ juce_add_binary_data(mmJucePlugin_BinaryData SOURCES
+ 	${COMMON_ASSETS} "tus_settings_gui_Monomachine.rml"
+ 	"tus_settings_dspaudio_Monomachine.rml" ${MM_SKIN_ASSETS})
+ 
++# Private local iOS test builds only: optionally embed the user's own ROM in
++# the matching app bundle. Each product gets its own variable so an MD ROM can
++# never end up in the MM app or vice versa. GEARMULATOR_IOS_ROM is the legacy
++# Machinedrum-only name and is still honoured for MD.
++set(GEARMULATOR_IOS_ROM_MD "" CACHE FILEPATH "iOS only: private Machinedrum ROM to embed in a local test bundle")
++set(GEARMULATOR_IOS_ROM_MM "" CACHE FILEPATH "iOS only: private Monomachine ROM to embed in a local test bundle")
++if(NOT GEARMULATOR_IOS_ROM_MD AND GEARMULATOR_IOS_ROM)
++	set(GEARMULATOR_IOS_ROM_MD "${GEARMULATOR_IOS_ROM}")
++endif()
++
++set(iosRomFile "${GEARMULATOR_IOS_ROM_MD}")
++set(iosRomName "machinedrum.bin")
+ createJucePlugin(mdJucePlugin "Gearmulator MD" TRUE "Tmdr" mdJucePlugin_BinaryData mdLib)
++
++set(iosRomFile "${GEARMULATOR_IOS_ROM_MM}")
++set(iosRomName "monomachine.bin")
+ createJucePlugin(mmJucePlugin "Gearmulator MM" TRUE "Tmno" mmJucePlugin_BinaryData mdLib)
+ 
++unset(iosRomFile)
++unset(iosRomName)
++
+ # MD/MM expose an optional stereo input to plug-in hosts. Starting the
+ # standalone with that input active makes CoreAudio combine the built-in input
+ # and output devices on common Mac setups, which can consume the real-time
+diff --git a/source/elektron/md/mdJucePlugin/mdEditor.cpp b/source/elektron/md/mdJucePlugin/mdEditor.cpp
+index 51d7464b..6094b0e2 100644
+--- a/source/elektron/md/mdJucePlugin/mdEditor.cpp
++++ b/source/elektron/md/mdJucePlugin/mdEditor.cpp
+@@ -31,6 +31,7 @@
+ #include "juceRmlUi/rmlElemKnob.h"
+ #include "juceRmlUi/rmlEventListener.h"
+ #include "juceRmlUi/rmlHelper.h"
++#include "juceRmlUi/rmlTouchRouter.h"
+ #include "juceRmlUi/juceRmlComponent.h"
+ 
+ #include "RmlUi/Core/Element.h"
+@@ -87,6 +88,10 @@ namespace mdJucePlugin
+ 		// Arbitrary endless-knob value range; only per-move deltas are used.
+ 		constexpr float g_encoderRange = 100.0f;
+ 		constexpr int g_encoderBurstCap = 8;	// max ±1 events emitted per Change
++		// Touch: holding an encoder this long without moving presses it; moving further
++		// than the slop (in document pixels) first makes the gesture a plain turn.
++		constexpr double g_touchEncoderHoldMilliseconds = 400.0;
++		constexpr float g_touchEncoderHoldSlop = 10.0f;
+ 		constexpr int g_presentationTimerId = 1;
+ 		constexpr int g_panelTimerId = 2;
+ 		constexpr int g_presentationTimerIntervalMilliseconds = 16;
+@@ -329,6 +334,7 @@ namespace mdJucePlugin
+ 		m_lcdCanvas = juceRmlUi::ElemCanvas::create(lcdArea);
+ 		m_lcdCanvas->setClearEveryFrame(true);
+ 		m_lcdCanvas->SetProperty(Rml::PropertyId::Drag, Rml::Style::Drag::Drag);
++		juceRmlUi::TouchRouter::setTouchCapture(m_lcdCanvas);
+ 		m_lcdCanvas->setRepaintGraphicsCallback([this](const juce::Image& _image, juce::Graphics& _g)
+ 		{
+ 			paintLcd(_image, _g);
+@@ -347,8 +353,8 @@ namespace mdJucePlugin
+ 				if(!target)
+ 					return;
+ 				const auto mouse = juceRmlUi::helper::getMousePos(_event);
+-				(void)m_lcdDragGesture.begin(*m_lcdInteractionState, *target,
+-					mouse.x, mouse.y);
++				if(m_lcdDragGesture.begin(*m_lcdInteractionState, *target, mouse.x, mouse.y))
++					m_lcdGestureTouch = juceRmlUi::TouchRouter::getTouchId(_event);
+ 				// RmlUi arms its drag source only after mousedown propagation completes.
+ 				// Stopping this event prevents every subsequent Drag event.
+ 			});
+@@ -489,6 +495,7 @@ namespace mdJucePlugin
+ 	void Editor::cancelLcdGesture()
+ 	{
+ 		m_lcdDragGesture.cancel();
++		m_lcdGestureTouch = -1;
+ 	}
+ 
+ 	void Editor::applyPixelPerfectPanel()
+@@ -526,6 +533,9 @@ namespace mdJucePlugin
+ 				continue;
+ 			}
+ 
++			// Every panel switch is held by its own finger.
++			juceRmlUi::TouchRouter::setTouchCapture(b);
++
+ 			// On the hardware, A/E through D/H are held while a trig key chooses the
+ 			// pattern number. A normal MM bank click therefore keeps its existing latch.
+ 			// When another Shift-held control is active, the bank acts as an ordinary
+@@ -584,7 +594,7 @@ namespace mdJucePlugin
+ 			juceRmlUi::EventListener::Add(document, Rml::EventId::Keyup,
+ 				[this](const Rml::Event& _event)
+ 				{
+-					if(!juceRmlUi::helper::getKeyModAlt(_event))
++					if(!juceRmlUi::helper::getKeyModAlt(_event) && m_encoderPressTouch < 0)
+ 						releaseEncoderPress();
+ 					if(_event.GetParameter<int>("shift_key", 0) == 0
+ 						&& !m_shiftPanelLatch.empty())
+@@ -601,20 +611,29 @@ namespace mdJucePlugin
+ 					_event.StopPropagation();
+ 					cancelPanelInputGestures();
+ 				});
++			// Only the pointer that started a gesture ends it: with several fingers
++			// down, every other finger's release bubbles up here as well.
+ 			juceRmlUi::EventListener::Add(document, Rml::EventId::Mouseup,
+ 				[this](Rml::Event& _event)
+ 				{
+-					if(juceRmlUi::helper::getMouseButton(_event) == juceRmlUi::MouseButton::Left)
+-					{
++					if(juceRmlUi::helper::getMouseButton(_event) != juceRmlUi::MouseButton::Left)
++						return;
++					const auto touch = juceRmlUi::TouchRouter::getTouchId(_event);
++					if(m_touchEncoderHold && m_touchEncoderHold->touch == touch)
++						m_touchEncoderHold.reset();
++					if(touch == m_encoderPressTouch)
+ 						releaseEncoderPress();
++					if(touch == m_lcdGestureTouch)
+ 						cancelLcdGesture();
+-					}
+ 				});
+ 			juceRmlUi::EventListener::Add(document, Rml::EventId::Dragend,
+ 				[this](Rml::Event&)
+ 				{
+-					releaseEncoderPress();
+-					cancelLcdGesture();
++					// RmlUi drags come from the mouse, never from a captured finger.
++					if(m_encoderPressTouch < 0)
++						releaseEncoderPress();
++					if(m_lcdGestureTouch < 0)
++						cancelLcdGesture();
+ 				});
+ 		}
+ 	}
+@@ -692,6 +711,7 @@ namespace mdJucePlugin
+ 			if(!element)
+ 				return;
+ 			element->SetClass(panelAffordances::g_affordanceClass, true);
++			juceRmlUi::TouchRouter::setTouchCapture(element);
+ 			juceRmlUi::EventListener::Add(element, Rml::EventId::Click, [this, _select](Rml::Event&)
+ 			{
+ 				releasePanelButtonGestures();
+@@ -746,6 +766,7 @@ namespace mdJucePlugin
+ 			return;
+ 
+ 		element->SetClass(panelAffordances::g_affordanceClass, true);
++		juceRmlUi::TouchRouter::setTouchCapture(element);
+ 		juceRmlUi::EventListener::Add(element, Rml::EventId::Mousedown,
+ 			[this, element, _control](Rml::Event&)
+ 		{
+@@ -764,6 +785,7 @@ namespace mdJucePlugin
+ 			return;
+ 
+ 		element->SetClass(panelAffordances::g_affordanceClass, true);
++		juceRmlUi::TouchRouter::setTouchCapture(element);
+ 		juceRmlUi::EventListener::Add(element, Rml::EventId::Mousedown,
+ 			[this, element, _control](Rml::Event&)
+ 		{
+@@ -863,6 +885,8 @@ namespace mdJucePlugin
+ 		if(m_pressedEncoder)
+ 			m_pressedEncoder->SetClass("encoderPressed", false);
+ 		m_pressedEncoder = nullptr;
++		m_encoderPressTouch = -1;
++		m_touchEncoderHold.reset();
+ 		if(wasActive)
+ 		{
+ 			// The held-switch state is a classifier input. Restore hit targets
+@@ -872,6 +896,53 @@ namespace mdJucePlugin
+ 		}
+ 	}
+ 
++	void Editor::beginEncoderPress(juceRmlUi::ElemKnob* const _knob,
++		const std::optional<md::PanelPacket>& _packet, const bool _left, const bool _alt, const int _touch)
++	{
++		if(!m_encoderPress.begin(_packet, _left, _alt))
++			return;
++
++		// Suppress LCD hit targets immediately, before firmware has time
++		// to draw the held-value overlay on the next presentation tick.
++		m_lcdInteractionInputChanged = true;
++		updateLcdInteractionState();
++		m_pressedEncoder = _knob;
++		m_encoderPressTouch = _touch;
++		_knob->SetClass("encoderPressed", true);
++		const auto combined = m_panelRows.press(*_packet);
++		(void)sendPanelEvent(combined.row, combined.mask);
++	}
++
++	bool Editor::isTouchHeld(const int _touch) const
++	{
++		const auto* rml = getRmlComponent();
++		return rml && rml->getTouchRouter().isCaptured(_touch);
++	}
++
++	void Editor::serviceTouchEncoderHold(const double _nowMilliseconds)
++	{
++		// The press is owned by a finger: it ends with that finger, nothing else.
++		if(m_encoderPress.active() && m_encoderPressTouch >= 0 && !isTouchHeld(m_encoderPressTouch))
++			releaseEncoderPress();
++
++		if(!m_touchEncoderHold)
++			return;
++
++		const auto hold = *m_touchEncoderHold;
++		if(!isTouchHeld(hold.touch))
++		{
++			m_touchEncoderHold.reset();
++			return;
++		}
++		if(_nowMilliseconds - hold.startMilliseconds < g_touchEncoderHoldMilliseconds)
++			return;
++
++		m_touchEncoderHold.reset();
++		// One encoder press at a time, as with the mouse; the newest hold wins.
++		releaseEncoderPress();
++		beginEncoderPress(hold.knob, hold.packet, true, true, hold.touch);
++	}
++
+ 	void Editor::globalFocusChanged(juce::Component* const _focusedComponent)
+ 	{
+ 		auto* const panel = getRmlComponent();
+@@ -1773,21 +1844,32 @@ namespace mdJucePlugin
+ 			juceRmlUi::EventListener::Add(_knob, Rml::EventId::Mousedown,
+ 				[this, _knob, packet](Rml::Event& _event)
+ 				{
++					const auto touch = juceRmlUi::TouchRouter::getTouchId(_event);
++					if(touch >= 0)
++					{
++						// Leave any press held by another finger alone; this finger
++						// presses only once it has rested here long enough.
++						const auto mouse = juceRmlUi::helper::getMousePos(_event);
++						m_touchEncoderHold = TouchEncoderHold{ _knob, packet, touch, mouse.x, mouse.y,
++							juce::Time::getMillisecondCounterHiRes() };
++						return;
++					}
+ 					releaseEncoderPress();
+-					if(m_encoderPress.begin(packet,
++					beginEncoderPress(_knob, packet,
+ 						juceRmlUi::helper::getMouseButton(_event) == juceRmlUi::MouseButton::Left
+ 							&& !juceRmlUi::helper::isContextMenu(_event),
+-						juceRmlUi::helper::getKeyModAlt(_event)))
+-					{
+-						// Suppress LCD hit targets immediately, before firmware has time
+-						// to draw the held-value overlay on the next presentation tick.
+-						m_lcdInteractionInputChanged = true;
+-						updateLcdInteractionState();
+-						m_pressedEncoder = _knob;
+-						_knob->SetClass("encoderPressed", true);
+-						const auto combined = m_panelRows.press(*packet);
+-						(void)sendPanelEvent(combined.row, combined.mask);
+-					}
++						juceRmlUi::helper::getKeyModAlt(_event), -1);
++				});
++			juceRmlUi::EventListener::Add(_knob, Rml::EventId::Drag,
++				[this, _knob](Rml::Event& _event)
++				{
++					if(!m_touchEncoderHold || m_touchEncoderHold->knob != _knob
++						|| m_touchEncoderHold->touch != juceRmlUi::TouchRouter::getTouchId(_event))
++						return;
++					const auto mouse = juceRmlUi::helper::getMousePos(_event);
++					if(std::abs(mouse.x - m_touchEncoderHold->x) + std::abs(mouse.y - m_touchEncoderHold->y)
++						> g_touchEncoderHoldSlop)
++						m_touchEncoderHold.reset();
+ 				});
+ 		}
+ 		_knob->setMinValue(0.0f);
+@@ -2057,8 +2139,10 @@ namespace mdJucePlugin
+ 
+ 		const auto nowMilliseconds = juce::Time::getMillisecondCounterHiRes();
+ 		const auto modifiers = juce::ModifierKeys::getCurrentModifiersRealtime();
+-		if(m_encoderPress.active() && (!modifiers.isAltDown() || !modifiers.isLeftButtonDown()))
++		if(m_encoderPress.active() && m_encoderPressTouch < 0
++			&& (!modifiers.isAltDown() || !modifiers.isLeftButtonDown()))
+ 			releaseEncoderPress();
++		serviceTouchEncoderHold(nowMilliseconds);
+ 		// Some plugin hosts can lose the modifier key-up when focus changes. Poll
+ 		// native state as a fail-safe so no panel row remains held indefinitely.
+ 		if(!m_shiftPanelLatch.empty()
+diff --git a/source/elektron/md/mdJucePlugin/mdEditor.h b/source/elektron/md/mdJucePlugin/mdEditor.h
+index fbed293e..8310f406 100644
+--- a/source/elektron/md/mdJucePlugin/mdEditor.h
++++ b/source/elektron/md/mdJucePlugin/mdEditor.h
+@@ -118,6 +118,10 @@ namespace mdJucePlugin
+ 		void endPanelGesture();
+ 		void releasePanelButtonGestures();
+ 		void releaseEncoderPress();
++		void beginEncoderPress(juceRmlUi::ElemKnob* _knob, const std::optional<md::PanelPacket>& _packet,
++			bool _left, bool _alt, int _touch);
++		void serviceTouchEncoderHold(double _nowMilliseconds);
++		bool isTouchHeld(int _touch) const;
+ 		void cancelPanelInputGestures();
+ 		void releaseAllPanelInputs();
+ 		void globalFocusChanged(juce::Component* _focusedComponent) override;
+@@ -195,6 +199,23 @@ namespace mdJucePlugin
+ 		panelAffordances::EncoderPressGesture m_encoderPress;
+ 		juceRmlUi::ElemKnob* m_pressedEncoder = nullptr;
+ 
++		// Finger that owns the encoder press / LCD drag, or -1 for the mouse. Other
++		// fingers lifting must not end them (see juceRmlUi::TouchRouter).
++		int m_encoderPressTouch = -1;
++		int m_lcdGestureTouch = -1;
++
++		// Fingers have no Alt key: an encoder held still for a moment is pressed.
++		struct TouchEncoderHold
++		{
++			juceRmlUi::ElemKnob* knob = nullptr;
++			std::optional<md::PanelPacket> packet;
++			int touch = -1;
++			float x = 0.0f;
++			float y = 0.0f;
++			double startMilliseconds = 0.0;
++		};
++		std::optional<TouchEncoderHold> m_touchEncoderHold;
++
+ 		struct ActivePanelButton
+ 		{
+ 			juceRmlUi::ElemButton* button = nullptr;
+diff --git a/source/juce.cmake b/source/juce.cmake
+index fefd123e..f9fc150b 100644
+--- a/source/juce.cmake
++++ b/source/juce.cmake
+@@ -153,11 +153,10 @@ macro(createJucePlugin targetName productName isSynth plugin4CC binaryDataProjec
+ 		IPHONE_SCREEN_ORIENTATIONS                        # The Machinedrum/Monomachine skins are landscape (1252x648); portrait
+ 			UIInterfaceOrientationLandscapeLeft            # cannot fit them at a usable scale, so iPhone is locked to landscape.
+ 			UIInterfaceOrientationLandscapeRight
+-		IPAD_SCREEN_ORIENTATIONS
+-			UIInterfaceOrientationPortrait
+-			UIInterfaceOrientationPortraitUpsideDown
++		IPAD_SCREEN_ORIENTATIONS                          # iPad too: portrait would shrink the panel to ~65% of the landscape fit
+ 			UIInterfaceOrientationLandscapeLeft
+ 			UIInterfaceOrientationLandscapeRight
++		REQUIRES_FULL_SCREEN TRUE                         # iPad: landscape-only needs opting out of Split View/Slide Over
+ 	)
+ 
+ 	if(CMAKE_SYSTEM_NAME STREQUAL "iOS" AND TARGET ${targetName}_Standalone)
+@@ -168,12 +167,14 @@ macro(createJucePlugin targetName productName isSynth plugin4CC binaryDataProjec
+ 
+ 	# Private local testing only. The ROM is never copied unless the caller
+ 	# explicitly supplies its path; release builds should use Files import.
+-	if(CMAKE_SYSTEM_NAME STREQUAL "iOS" AND GEARMULATOR_IOS_ROM AND EXISTS "${GEARMULATOR_IOS_ROM}")
++	# The caller selects the ROM per target by setting iosRomFile/iosRomName
++	# before invoking this macro, so each product only ever embeds its own ROM.
++	if(CMAKE_SYSTEM_NAME STREQUAL "iOS" AND iosRomFile AND EXISTS "${iosRomFile}")
+ 		add_custom_command(TARGET ${targetName}_Standalone POST_BUILD
+ 			COMMAND ${CMAKE_COMMAND} -E copy_if_different
+-				"${GEARMULATOR_IOS_ROM}"
+-				"$<TARGET_BUNDLE_DIR:${targetName}_Standalone>/machinedrum.bin"
+-			COMMENT "Copying explicitly supplied private Machinedrum ROM into local iOS test bundle")
++				"${iosRomFile}"
++				"$<TARGET_BUNDLE_DIR:${targetName}_Standalone>/${iosRomName}"
++			COMMENT "Copying explicitly supplied private ROM into local iOS test bundle as ${iosRomName}")
+ 	endif()
+ 
+ 	# JUCE otherwise puts the internal SharedCode archive beside the final plug-in
+diff --git a/source/juceRmlUi/CMakeLists.txt b/source/juceRmlUi/CMakeLists.txt
+index 8cd21f66..0f794fef 100644
+--- a/source/juceRmlUi/CMakeLists.txt
++++ b/source/juceRmlUi/CMakeLists.txt
+@@ -41,6 +41,7 @@ set(SOURCES
+ 	rmlRendererJuce.cpp rmlRendererJuce.h
+ 	rmlShaders.h
+ 	rmlSystemInterface.cpp rmlSystemInterface.h
++	rmlTouchRouter.cpp rmlTouchRouter.h
+ 	rmlTree.cpp rmlTree.h
+ 	rmlTreeNode.cpp rmlTreeNode.h
+ 
+@@ -122,4 +123,9 @@ if(BUILD_TESTING)
+ 	target_link_libraries(juceRmlMouseInputTest PRIVATE juceRmlUi)
+ 	set_property(TARGET juceRmlMouseInputTest PROPERTY FOLDER "juceRmlUi/test")
+ 	add_test(NAME juceRmlMouseInputTest COMMAND juceRmlMouseInputTest)
++
++	add_executable(juceRmlTouchRouterTest test/rmlTouchRouter_test.cpp)
++	target_link_libraries(juceRmlTouchRouterTest PRIVATE juceRmlUi)
++	set_property(TARGET juceRmlTouchRouterTest PROPERTY FOLDER "juceRmlUi/test")
++	add_test(NAME juceRmlTouchRouterTest COMMAND juceRmlTouchRouterTest)
+ endif()
+diff --git a/source/juceRmlUi/juceRmlComponent.cpp b/source/juceRmlUi/juceRmlComponent.cpp
+index dde8236c..64044acf 100644
+--- a/source/juceRmlUi/juceRmlComponent.cpp
++++ b/source/juceRmlUi/juceRmlComponent.cpp
+@@ -536,6 +536,30 @@ namespace juceRmlUi
+ 		if (isVisible() && m_metalContext)
+ 			attachMetalContext();
+ #endif
++
++		// A hidden panel never receives the matching touch-ups.
++		if (!isVisible())
++			cancelTouches();
++	}
++
++	bool RmlComponent::isTouch(const juce::MouseEvent& _event)
++	{
++		return _event.source.isTouch() || _event.source.isPen();
++	}
++
++	void RmlComponent::cancelTouches()
++	{
++		if (!m_rmlContext)
++			return;
++
++		RmlInterfaces::ScopedAccess access(*this);
++
++		if (m_touchRouter.cancelAll())
++		{
++			m_rmlContext->ProcessMouseButtonUp(0, 0);
++			m_rmlContext->ProcessMouseLeave();
++		}
++		enqueueUpdate();
+ 	}
+ 
+ 	void RmlComponent::mouseDown(const juce::MouseEvent& _event)
+@@ -547,6 +571,17 @@ namespace juceRmlUi
+ 		// in sync here as well as in mouseMove(), because a resize/display-scale
+ 		// change can otherwise leave the first click using stale coordinates.
+ 		const auto pos = toRmlPosition(_event);
++
++		// Fingers are routed individually so that several can hold controls at once,
++		// see TouchRouter. Only a finger it hands back uses the context mouse.
++		if (isTouch(_event) && m_touchRouter.down(*m_rmlContext, _event.source.getIndex(),
++			{ pos.x, pos.y }, toRmlModifiers(_event)) != TouchRouter::Route::Context)
++		{
++			logPointerDiagnostic("touchdown", _event, pos);
++			enqueueUpdate();
++			return;
++		}
++
+ 		mouseInput::processButtonDown(*m_rmlContext, { pos.x, pos.y },
+ 			static_cast<int>(helper::toRmlMouseButton(_event)), toRmlModifiers(_event));
+ 		logPointerDiagnostic("down", _event, pos);
+@@ -558,6 +593,21 @@ namespace juceRmlUi
+ 		Component::mouseUp(_event);
+ 		RmlInterfaces::ScopedAccess access(*this);
+ 		const auto pos = toRmlPosition(_event);
++
++		if (isTouch(_event))
++		{
++			if (m_touchRouter.up(_event.source.getIndex(), { pos.x, pos.y }, toRmlModifiers(_event))
++				== TouchRouter::Route::Context)
++			{
++				// Fingers do not hover. Leaving the context mouse parked over the
++				// released element would send it a late Mouseout later on.
++				mouseInput::processButtonUp(*m_rmlContext, { pos.x, pos.y }, 0, toRmlModifiers(_event));
++				m_rmlContext->ProcessMouseLeave();
++			}
++			enqueueUpdate();
++			return;
++		}
++
+ 		mouseInput::processButtonUp(*m_rmlContext, { pos.x, pos.y },
+ 			static_cast<int>(helper::toRmlMouseButton(_event)), toRmlModifiers(_event));
+ 		enqueueUpdate();
+@@ -566,6 +616,12 @@ namespace juceRmlUi
+ 	void RmlComponent::mouseMove(const juce::MouseEvent& _event)
+ 	{
+ 		Component::mouseMove(_event);
++
++		// A finger only moves while it is down (mouseDrag). JUCE's synthetic
++		// pre-touch move must not move the context mouse away from another finger.
++		if (isTouch(_event))
++			return;
++
+ 		RmlInterfaces::ScopedAccess access(*this);
+ 
+ 		const auto pos = toRmlPosition(_event);
+@@ -581,6 +637,13 @@ namespace juceRmlUi
+ 
+ 		const auto pos = toRmlPosition(_event);
+ 
++		if (isTouch(_event) && m_touchRouter.move(_event.source.getIndex(), { pos.x, pos.y },
++			toRmlModifiers(_event)) != TouchRouter::Route::Context)
++		{
++			enqueueUpdate();
++			return;
++		}
++
+ 		m_rmlContext->ProcessMouseMove(pos.x, pos.y, toRmlModifiers(_event));
+ 
+ 		// forward out-of-bounds drag events to the drag handler to allow it to convert to a juce drag if the drag source can export files
+@@ -593,6 +656,12 @@ namespace juceRmlUi
+ 	void RmlComponent::mouseExit(const juce::MouseEvent& _event)
+ 	{
+ 		Component::mouseExit(_event);
++
++		// Touch hover is cleared on touch-up; a finger leaving must not unhover the
++		// element that another finger is using through the context.
++		if (isTouch(_event))
++			return;
++
+ 		RmlInterfaces::ScopedAccess access(*this);
+ 		if (m_rmlContext)
+ 			m_rmlContext->ProcessMouseLeave();
+@@ -603,6 +672,10 @@ namespace juceRmlUi
+ 	void RmlComponent::mouseEnter(const juce::MouseEvent& _event)
+ 	{
+ 		Component::mouseEnter(_event);
++
++		if (isTouch(_event))
++			return;
++
+ 		RmlInterfaces::ScopedAccess access(*this);
+ 
+ 		const auto pos = toRmlPosition(_event);
+@@ -1321,6 +1394,10 @@ namespace juceRmlUi
+ 
+ 	void RmlComponent::destroyRmlContext()
+ 	{
++		// No events here: listeners may belong to an owner that is already being
++		// torn down. The elements themselves are about to go away.
++		m_touchRouter.forgetAll();
++
+ 		{
+ 			std::scoped_lock lock(m_timerMutex);
+ 			stopTimer();
+diff --git a/source/juceRmlUi/juceRmlComponent.h b/source/juceRmlUi/juceRmlComponent.h
+index 75992cba..a59c78b5 100644
+--- a/source/juceRmlUi/juceRmlComponent.h
++++ b/source/juceRmlUi/juceRmlComponent.h
+@@ -5,6 +5,7 @@
+ #include "juceRmlDrag.h"
+ #include "rmlInterfaces.h"
+ #include "rmlRendererProxy.h"
++#include "rmlTouchRouter.h"
+ #include "baseLib/event.h"
+ 
+ #include "juce_gui_basics/juce_gui_basics.h"
+@@ -149,6 +150,10 @@ namespace juceRmlUi
+ 		void paint(juce::Graphics& _g) override;
+ 
+ 		Component* getComponentAt(juce::Point<float> _position) override;
++
++		const TouchRouter& getTouchRouter() const { return m_touchRouter; }
++		// Releases every finger currently held on the panel, e.g. when the view goes away.
++		void cancelTouches();
+ 		Rml::Element* getLastElementByGetComponentAt() const { return m_lastGetComponentAt.get(); }
+ 
+ 	private:
+@@ -167,6 +172,8 @@ namespace juceRmlUi
+ 
+ 		Rml::Vector2i getRenderSize() const;
+ 
++		static bool isTouch(const juce::MouseEvent& _event);
++
+ 		int toRmlModifiers(const juce::MouseEvent& _event);
+ 		int toRmlModifiers(const juce::KeyPress& _event);
+ 		int toRmlModifiers(const juce::ModifierKeys& _mods);
+@@ -191,6 +198,8 @@ namespace juceRmlUi
+ 		Rml::Context* m_rmlContext = nullptr;
+ 		Rml::ElementDocument* m_document = nullptr;
+ 
++		TouchRouter m_touchRouter;
++
+ 		std::vector<juce::KeyPress> m_pressedKeys;
+ 		float m_contentScale = 1.0f;
+ 		float m_currentRenderScale = 0.0f;
+diff --git a/source/juceRmlUi/rmlElemKnob.cpp b/source/juceRmlUi/rmlElemKnob.cpp
+index ac8e81ea..05d8bafd 100644
+--- a/source/juceRmlUi/rmlElemKnob.cpp
++++ b/source/juceRmlUi/rmlElemKnob.cpp
+@@ -1,6 +1,7 @@
+ #include "rmlElemKnob.h"
+ 
+ #include "rmlHelper.h"
++#include "rmlTouchRouter.h"
+ 
+ #include <cmath>
+ 
+@@ -8,6 +9,9 @@ namespace juceRmlUi
+ {
+ 	ElemKnob::ElemKnob(Rml::CoreInstance& _coreInstance, const Rml::String& _tag): ElemValue(_coreInstance, _tag)
+ 	{
++		// Each finger turns its own knob; see TouchRouter.
++		TouchRouter::setTouchCapture(this);
++
+ 		AddEventListener(Rml::EventId::Mousedown, this);
+ 		AddEventListener(Rml::EventId::Drag, this);
+ 		AddEventListener(Rml::EventId::Mousescroll, this);
+diff --git a/source/juceRmlUi/rmlTouchRouter.h b/source/juceRmlUi/rmlTouchRouter.h
+new file mode 100644
+index 00000000..1bbbfe43
+--- /dev/null
++++ b/source/juceRmlUi/rmlTouchRouter.h
+@@ -0,0 +1,93 @@
++#pragma once
++
++#include "RmlUi/Core/ObserverPtr.h"
++#include "RmlUi/Core/Types.h"
++
++#include <map>
++#include <optional>
++
++namespace Rml
++{
++	class Context;
++	class Element;
++	class Event;
++}
++
++namespace juceRmlUi
++{
++	// Per-finger pointer routing for touch screens.
++	//
++	// RmlUi models exactly one mouse. Feeding several fingers through it makes every
++	// new finger move that mouse, which fires Mouseout on the control the previous
++	// finger is holding and releases it. The router therefore splits touches in two:
++	//
++	// - A finger that lands on a touch-capture element (see setTouchCapture(); every
++	//   ElemKnob is one) bypasses the context mouse entirely. It owns that element until
++	//   it lifts: Mousedown, Drag and Mouseup (+ Click when lifted inside) are dispatched
++	//   straight to the element it hit, never Mouseout. Events carry a "touch_id"
++	//   parameter so listeners can tell fingers apart.
++	// - Any other finger is routed through the context as a normal mouse, but only one
++	//   at a time; further fingers on non-capture UI are ignored while it is down.
++	//
++	// Several fingers on the same capture element share it: only the first one sends
++	// Mousedown/Drag, and the Mouseup is sent only when the last of them lifts. A lifted finger
++	// therefore never releases a control another finger still holds.
++	class TouchRouter
++	{
++	public:
++		enum class Route
++		{
++			Captured,	// the router dispatched (or deliberately suppressed) the events itself
++			Context,	// the caller must feed this finger through the Rml context
++			Ignored		// drop the event
++		};
++
++		static constexpr const char* g_captureAttribute = "touchcapture";
++		static constexpr const char* g_touchIdParameter = "touch_id";
++		static constexpr const char* g_touchCancelParameter = "touch_cancel";
++
++		static void setTouchCapture(Rml::Element* _element, bool _capture = true);
++		static Rml::Element* findCaptureRoot(Rml::Element* _hit);
++
++		// Returns the touch id carried by an event dispatched by the router, or -1 for
++		// events that came through the context (ordinary mouse, or the context finger).
++		static int getTouchId(const Rml::Event& _event);
++		static bool isTouchCancel(const Rml::Event& _event);
++
++		Route down(Rml::Context& _context, int _touchId, Rml::Vector2i _position, int _keyModifiers);
++		Route move(int _touchId, Rml::Vector2i _position, int _keyModifiers);
++		Route up(int _touchId, Rml::Vector2i _position, int _keyModifiers);
++
++		// Releases every captured finger with a Mouseup that carries touch_cancel=1 and no
++		// Click. Returns true if a finger was routed through the context; the caller must
++		// then release the context mouse button itself.
++		bool cancelAll(int _keyModifiers = 0);
++
++		// Drops every finger without dispatching anything, for teardown.
++		void forgetAll()
++		{
++			m_fingers.clear();
++			m_contextFinger.reset();
++		}
++
++		bool isCaptured(int _touchId) const { return m_fingers.find(_touchId) != m_fingers.end(); }
++		bool hasContextFinger() const { return m_contextFinger.has_value(); }
++		bool isContextFinger(const int _touchId) const { return m_contextFinger && *m_contextFinger == _touchId; }
++		size_t capturedCount() const { return m_fingers.size(); }
++
++	private:
++		struct Finger
++		{
++			Rml::ObserverPtr<Rml::Element> target;	// deepest element hit on touch-down
++			Rml::ObserverPtr<Rml::Element> root;	// the touch-capture element that owns the finger
++			Rml::Vector2i position;
++			bool drags = false;						// only the first finger on a root sends Mousedown/Drag
++		};
++
++		bool rootHasOtherFinger(const Rml::Element* _root, int _exceptTouchId) const;
++		void release(int _touchId, Rml::Vector2i _position, int _keyModifiers, bool _cancel);
++
++		std::map<int, Finger> m_fingers;
++		std::optional<int> m_contextFinger;
++	};
++}
+diff --git a/source/juceRmlUi/rmlTouchRouter.cpp b/source/juceRmlUi/rmlTouchRouter.cpp
+new file mode 100644
+index 00000000..02e6da88
+--- /dev/null
++++ b/source/juceRmlUi/rmlTouchRouter.cpp
+@@ -0,0 +1,200 @@
++#include "rmlTouchRouter.h"
++
++#include "RmlUi/Core/Context.h"
++#include "RmlUi/Core/Element.h"
++#include "RmlUi/Core/Event.h"
++
++namespace juceRmlUi
++{
++	namespace
++	{
++		// Same parameter set the context generates for its own mouse events, so existing
++		// listeners (helper::getMousePos, getMouseButton, getKeyMod*) work unchanged.
++		Rml::Dictionary makeParameters(const int _touchId, const Rml::Vector2i _position,
++			const int _keyModifiers, const bool _cancel)
++		{
++			static const char* const modifierNames[] = { "ctrl_key", "shift_key", "alt_key", "meta_key",
++				"caps_lock_key", "num_lock_key", "scroll_lock_key" };
++
++			Rml::Dictionary parameters;
++			parameters["mouse_x"] = _position.x;
++			parameters["mouse_y"] = _position.y;
++			parameters["button"] = 0;
++			for(int i = 0; i < 7; ++i)
++				parameters[modifierNames[i]] = (_keyModifiers & (1 << i)) ? 1 : 0;
++			parameters[TouchRouter::g_touchIdParameter] = _touchId;
++			if(_cancel)
++				parameters[TouchRouter::g_touchCancelParameter] = 1;
++			return parameters;
++		}
++	}
++
++	void TouchRouter::setTouchCapture(Rml::Element* _element, const bool _capture)
++	{
++		if(!_element)
++			return;
++		if(_capture)
++			_element->SetAttribute(g_captureAttribute, true);
++		else
++			_element->RemoveAttribute(g_captureAttribute);
++	}
++
++	Rml::Element* TouchRouter::findCaptureRoot(Rml::Element* _hit)
++	{
++		for(auto* e = _hit; e; e = e->GetParentNode())
++		{
++			if(e->HasAttribute(g_captureAttribute))
++				return e;
++		}
++		return nullptr;
++	}
++
++	int TouchRouter::getTouchId(const Rml::Event& _event)
++	{
++		return _event.GetParameter<int>(g_touchIdParameter, -1);
++	}
++
++	bool TouchRouter::isTouchCancel(const Rml::Event& _event)
++	{
++		return _event.GetParameter<int>(g_touchCancelParameter, 0) != 0;
++	}
++
++	TouchRouter::Route TouchRouter::down(Rml::Context& _context, const int _touchId,
++		const Rml::Vector2i _position, const int _keyModifiers)
++	{
++		// A repeated down for a finger we still track means its up got lost. Finish the
++		// old gesture first so the element does not stay held forever.
++		if(isCaptured(_touchId))
++			release(_touchId, _position, _keyModifiers, true);
++
++		auto* hit = _context.GetElementAtPoint({ static_cast<float>(_position.x), static_cast<float>(_position.y) });
++		auto* root = findCaptureRoot(hit);
++
++		if(!root)
++		{
++			if(m_contextFinger && *m_contextFinger != _touchId)
++				return Route::Ignored;
++			m_contextFinger = _touchId;
++			return Route::Context;
++		}
++
++		Finger finger;
++		finger.target = hit->GetObserverPtr(hit->GetCoreInstance());
++		finger.root = root->GetObserverPtr(root->GetCoreInstance());
++		finger.position = _position;
++		finger.drags = !rootHasOtherFinger(root, _touchId);
++		m_fingers[_touchId] = finger;
++
++		if(finger.drags)
++		{
++			auto parameters = makeParameters(_touchId, _position, _keyModifiers, false);
++			hit->DispatchEvent(Rml::EventId::Mousedown, parameters);
++		}
++		return Route::Captured;
++	}
++
++	TouchRouter::Route TouchRouter::move(const int _touchId, const Rml::Vector2i _position, const int _keyModifiers)
++	{
++		if(isContextFinger(_touchId))
++			return Route::Context;
++
++		const auto it = m_fingers.find(_touchId);
++		if(it == m_fingers.end())
++			return Route::Ignored;
++
++		auto& finger = it->second;
++		if(finger.position == _position)
++			return Route::Captured;
++		finger.position = _position;
++
++		// A second finger on the same control holds it but does not drag it: two
++		// fingers feeding one knob would make it jump between their positions.
++		if(!finger.drags)
++			return Route::Captured;
++
++		if(auto* target = finger.target.get())
++		{
++			auto parameters = makeParameters(_touchId, _position, _keyModifiers, false);
++			target->DispatchEvent(Rml::EventId::Drag, parameters);
++		}
++		return Route::Captured;
++	}
++
++	TouchRouter::Route TouchRouter::up(const int _touchId, const Rml::Vector2i _position, const int _keyModifiers)
++	{
++		if(isContextFinger(_touchId))
++		{
++			m_contextFinger.reset();
++			return Route::Context;
++		}
++
++		if(!isCaptured(_touchId))
++			return Route::Ignored;
++
++		release(_touchId, _position, _keyModifiers, false);
++		return Route::Captured;
++	}
++
++	bool TouchRouter::cancelAll(const int _keyModifiers)
++	{
++		while(!m_fingers.empty())
++		{
++			const auto it = m_fingers.begin();
++			release(it->first, it->second.position, _keyModifiers, true);
++		}
++
++		const auto hadContextFinger = m_contextFinger.has_value();
++		m_contextFinger.reset();
++		return hadContextFinger;
++	}
++
++	bool TouchRouter::rootHasOtherFinger(const Rml::Element* _root, const int _exceptTouchId) const
++	{
++		for(const auto& [id, finger] : m_fingers)
++		{
++			if(id != _exceptTouchId && finger.root.get() == _root)
++				return true;
++		}
++		return false;
++	}
++
++	void TouchRouter::release(const int _touchId, const Rml::Vector2i _position,
++		const int _keyModifiers, const bool _cancel)
++	{
++		const auto it = m_fingers.find(_touchId);
++		if(it == m_fingers.end())
++			return;
++
++		const auto finger = it->second;
++		m_fingers.erase(it);
++
++		auto* root = finger.root.get();
++		auto* target = finger.target.get();
++
++		// The element went away while held (document reload, skin switch).
++		if(!root || !target)
++			return;
++
++		// Another finger still holds this control: keep it held and send nothing. The
++		// remaining fingers stay passive, since ElemKnob and the LCD gesture take their
++		// drag origin from Mousedown only and would jump if a joiner started dragging.
++		// Whichever finger lifts last sends the Mouseup.
++		if(rootHasOtherFinger(root, _touchId))
++			return;
++
++		auto parameters = makeParameters(_touchId, _position, _keyModifiers, _cancel);
++		target->DispatchEvent(Rml::EventId::Mouseup, parameters);
++
++		if(_cancel)
++			return;
++
++		// Mirror RmlUi: a click needs the release to happen over the element that was
++		// pressed. The element may have been removed by the Mouseup handler.
++		if(auto* stillThere = finger.target.get(); stillThere && root == finger.root.get()
++			&& root->IsPointWithinElement({ static_cast<float>(_position.x), static_cast<float>(_position.y) }))
++		{
++			auto clickParameters = makeParameters(_touchId, _position, _keyModifiers, false);
++			stillThere->DispatchEvent(Rml::EventId::Click, clickParameters);
++		}
++	}
++}
+diff --git a/source/juceRmlUi/test/rmlTouchRouter_test.cpp b/source/juceRmlUi/test/rmlTouchRouter_test.cpp
+new file mode 100644
+index 00000000..fa1f4715
+--- /dev/null
++++ b/source/juceRmlUi/test/rmlTouchRouter_test.cpp
+@@ -0,0 +1,341 @@
++#include "juceRmlUi/rmlTouchRouter.h"
++
++#include "RmlUi/Core/Context.h"
++#include "RmlUi/Core/Core.h"
++#include "RmlUi/Core/CoreInstance.h"
++#include "RmlUi/Core/ElementDocument.h"
++#include "RmlUi/Core/Event.h"
++#include "RmlUi/Core/EventListener.h"
++#include "RmlUi/Core/RenderInterface.h"
++#include "RmlUi/Core/SystemInterface.h"
++
++#include <cstdio>
++#include <string>
++#include <vector>
++
++namespace
++{
++	using juceRmlUi::TouchRouter;
++	using Route = TouchRouter::Route;
++
++	bool check(const bool _condition, const char* _message)
++	{
++		if(!_condition)
++			std::fprintf(stderr, "rmlTouchRouter_test: %s\n", _message);
++		return _condition;
++	}
++
++	class RenderInterface final : public Rml::RenderInterface
++	{
++	public:
++		explicit RenderInterface(Rml::CoreInstance& _core) : Rml::RenderInterface(_core) {}
++
++		Rml::CompiledGeometryHandle CompileGeometry(Rml::Span<const Rml::Vertex>, Rml::Span<const int>) override
++		{
++			return Rml::CompiledGeometryHandle(++m_nextGeometry);
++		}
++		void RenderGeometry(Rml::CompiledGeometryHandle, Rml::Vector2f, Rml::TextureHandle) override {}
++		void ReleaseGeometry(Rml::CompiledGeometryHandle) override {}
++		Rml::TextureHandle LoadTexture(Rml::Vector2i&, const Rml::String&) override { return {}; }
++		Rml::TextureHandle GenerateTexture(Rml::Span<const Rml::byte>, Rml::Vector2i) override { return {}; }
++		void ReleaseTexture(Rml::TextureHandle) override {}
++		void EnableScissorRegion(bool) override {}
++		void SetScissorRegion(Rml::Rectanglei) override {}
++
++	private:
++		uintptr_t m_nextGeometry = 0;
++	};
++
++	class SystemInterface final : public Rml::SystemInterface
++	{
++	public:
++		explicit SystemInterface(Rml::CoreInstance& _core) : Rml::SystemInterface(_core) {}
++		double GetElapsedTime() override { return 1.0; }
++	};
++
++	const char* eventName(const Rml::EventId _id)
++	{
++		switch(_id)
++		{
++		case Rml::EventId::Mouseout: return "mouseout";
++		case Rml::EventId::Mousedown: return "mousedown";
++		case Rml::EventId::Mouseup: return "mouseup";
++		case Rml::EventId::Click: return "click";
++		case Rml::EventId::Drag: return "drag";
++		default: return "other";
++		}
++	}
++
++	// Logs "<event>:<id>#<touch>[@x,y][!cancel]"; touch -1 means the context mouse.
++	class EventLog final : public Rml::EventListener
++	{
++	public:
++		void ProcessEvent(Rml::Event& _event) override
++		{
++			// Listen in the capture phase on the document so every event is logged once.
++			const auto* target = _event.GetTargetElement();
++			if(!target || target->GetId().empty())
++				return;
++			auto entry = std::string(eventName(_event.GetId())) + ":" + target->GetId()
++				+ "#" + std::to_string(TouchRouter::getTouchId(_event));
++			if(_event.GetId() == Rml::EventId::Drag)
++				entry += "@" + std::to_string(_event.GetParameter<int>("mouse_x", -1))
++					+ "," + std::to_string(_event.GetParameter<int>("mouse_y", -1));
++			if(TouchRouter::isTouchCancel(_event))
++				entry += "!cancel";
++			events.push_back(entry);
++		}
++
++		std::vector<std::string> events;
++	};
++
++	// Three 100x100 cells in a row: a and b capture touches, c is ordinary UI.
++	class Fixture
++	{
++	public:
++		Fixture() : renderer(core), system(core)
++		{
++			Rml::SetRenderInterface(core, &renderer);
++			Rml::SetSystemInterface(core, &system);
++			initialized = Rml::Initialise(core);
++			if(!initialized)
++				return;
++
++			context = Rml::CreateContext(core, "touch-router-test", { 300, 100 });
++			if(!context)
++				return;
++
++			static constexpr const char* source = R"(
++<rml>
++<head><style>
++body { margin: 0; width: 300px; height: 100px; }
++div { position: absolute; top: 0; width: 100px; height: 100px; }
++#a { left: 0; }
++#b { left: 100px; }
++#c { left: 200px; }
++#aInner { left: 25px; top: 25px; width: 50px; height: 50px; }
++</style></head>
++<body><div id="a" touchcapture="1"><div id="aInner"></div></div><div id="b"></div><div id="c"></div></body>
++</rml>)";
++			document = context->LoadDocumentFromMemory(source);
++			if(!document)
++				return;
++
++			// Exercise the programmatic path for b.
++			TouchRouter::setTouchCapture(document->GetElementById("b"));
++
++			for(const auto event : { Rml::EventId::Mouseout, Rml::EventId::Mousedown,
++				Rml::EventId::Mouseup, Rml::EventId::Click, Rml::EventId::Drag })
++				document->AddEventListener(event, &log, true);
++
++			document->Show();
++			context->Update();
++		}
++
++		~Fixture()
++		{
++			if(document)
++				document->Close();
++			if(context)
++				Rml::RemoveContext(core, "touch-router-test");
++			if(initialized)
++				Rml::Shutdown(core);
++		}
++
++		bool valid() const { return initialized && context && document; }
++
++		Rml::CoreInstance core;
++		RenderInterface renderer;
++		SystemInterface system;
++		Rml::Context* context = nullptr;
++		Rml::ElementDocument* document = nullptr;
++		EventLog log;
++		bool initialized = false;
++	};
++
++	bool expectEvents(const EventLog& _log, const std::vector<std::string>& _expected, const char* _scenario)
++	{
++		if(_log.events == _expected)
++			return true;
++
++		std::fprintf(stderr, "rmlTouchRouter_test: %s mismatch\n  actual:", _scenario);
++		for(const auto& event : _log.events)
++			std::fprintf(stderr, " %s", event.c_str());
++		std::fprintf(stderr, "\n  expected:");
++		for(const auto& event : _expected)
++			std::fprintf(stderr, " %s", event.c_str());
++		std::fprintf(stderr, "\n");
++		return false;
++	}
++
++	// Trig + trig (or Function + trig): lifting either finger releases only its own
++	// control, and neither sees a Mouseout.
++	bool testIndependentHolds()
++	{
++		Fixture f;
++		if(!check(f.valid(), "fixture"))
++			return false;
++		TouchRouter router;
++		bool ok = true;
++		ok &= check(router.down(*f.context, 1, { 50, 10 }, 0) == Route::Captured, "a captured");
++		ok &= check(router.down(*f.context, 2, { 150, 50 }, 0) == Route::Captured, "b captured");
++		ok &= check(router.up(1, { 50, 10 }, 0) == Route::Captured, "a up");
++		ok &= check(router.isCaptured(2) && !router.isCaptured(1), "b still held");
++		ok &= check(router.up(2, { 150, 50 }, 0) == Route::Captured, "b up");
++		ok &= expectEvents(f.log, {
++			"mousedown:a#1", "mousedown:b#2", "mouseup:a#1", "click:a#1", "mouseup:b#2", "click:b#2"
++		}, "independent holds");
++		return ok;
++	}
++
++	// Two fingers on one control: the first lift must not release it.
++	bool testSharedControl()
++	{
++		Fixture f;
++		if(!check(f.valid(), "fixture"))
++			return false;
++		TouchRouter router;
++		bool ok = true;
++		router.down(*f.context, 1, { 10, 10 }, 0);
++		router.down(*f.context, 2, { 50, 50 }, 0);	// lands on aInner, same capture root
++		router.move(2, { 60, 60 }, 0);				// joiner does not drag
++		router.up(1, { 10, 10 }, 0);				// first finger lifts: still held
++		ok &= check(router.isCaptured(2), "second finger still holds a");
++		router.move(1, { 20, 20 }, 0);				// stale finger: ignored
++		router.up(2, { 60, 60 }, 0);
++		ok &= expectEvents(f.log, {
++			"mousedown:a#1", "mouseup:aInner#2", "click:aInner#2"
++		}, "shared control");
++		return ok;
++	}
++
++	// Two encoders turned at once: each finger drags its own knob with its own coordinates.
++	bool testIndependentDrags()
++	{
++		Fixture f;
++		if(!check(f.valid(), "fixture"))
++			return false;
++		TouchRouter router;
++		router.down(*f.context, 1, { 10, 90 }, 0);
++		router.down(*f.context, 2, { 110, 90 }, 0);
++		router.move(1, { 10, 80 }, 0);
++		router.move(2, { 110, 70 }, 0);
++		router.move(2, { 110, 70 }, 0);				// unchanged position: no event
++		router.move(1, { 250, 80 }, 0);				// dragging off the control keeps capture
++		router.up(1, { 250, 80 }, 0);				// released outside: no click
++		router.up(2, { 110, 70 }, 0);
++		return expectEvents(f.log, {
++			"mousedown:a#1", "mousedown:b#2", "drag:a#1@10,80", "drag:b#2@110,70", "drag:a#1@250,80",
++			"mouseup:a#1", "mouseup:b#2", "click:b#2"
++		}, "independent drags");
++	}
++
++	// Ordinary UI keeps using the context mouse, one finger at a time, alongside captures.
++	bool testContextFinger()
++	{
++		Fixture f;
++		if(!check(f.valid(), "fixture"))
++			return false;
++		TouchRouter router;
++		bool ok = true;
++		ok &= check(router.down(*f.context, 1, { 250, 50 }, 0) == Route::Context, "c goes to context");
++		ok &= check(router.isContextFinger(1), "finger 1 owns context");
++		ok &= check(router.down(*f.context, 2, { 260, 50 }, 0) == Route::Ignored, "second context finger ignored");
++		ok &= check(router.move(2, { 261, 50 }, 0) == Route::Ignored, "ignored finger stays ignored");
++		ok &= check(router.down(*f.context, 3, { 50, 50 }, 0) == Route::Captured, "capture beside context finger");
++		ok &= check(router.move(1, { 240, 50 }, 0) == Route::Context, "context finger moves via context");
++		ok &= check(router.up(1, { 240, 50 }, 0) == Route::Context, "context finger up via context");
++		ok &= check(!router.hasContextFinger(), "context released");
++		ok &= check(router.down(*f.context, 2, { 260, 50 }, 0) == Route::Context, "context free again");
++		ok &= check(router.isCaptured(3), "capture untouched by context finger");
++		return ok;
++	}
++
++	// Cancellation (touchesCancelled, focus loss, hiding) releases everything without clicks.
++	bool testCancel()
++	{
++		Fixture f;
++		if(!check(f.valid(), "fixture"))
++			return false;
++		TouchRouter router;
++		bool ok = true;
++		router.down(*f.context, 1, { 50, 50 }, 0);
++		router.down(*f.context, 2, { 150, 50 }, 0);
++		router.down(*f.context, 3, { 250, 50 }, 0);
++		ok &= check(router.cancelAll(), "cancel reports the context finger");
++		ok &= check(router.capturedCount() == 0 && !router.hasContextFinger(), "all fingers gone");
++		ok &= check(router.up(1, { 50, 50 }, 0) == Route::Ignored, "late up after cancel ignored");
++		ok &= expectEvents(f.log, {
++			"mousedown:aInner#1", "mousedown:b#2", "mouseup:aInner#1!cancel", "mouseup:b#2!cancel"
++		}, "cancel");
++		return ok;
++	}
++
++	// A finger id reused before its up arrived must not leave the old control held.
++	bool testLostUp()
++	{
++		Fixture f;
++		if(!check(f.valid(), "fixture"))
++			return false;
++		TouchRouter router;
++		router.down(*f.context, 1, { 10, 10 }, 0);
++		router.down(*f.context, 1, { 150, 10 }, 0);
++		router.up(1, { 150, 10 }, 0);
++		return expectEvents(f.log, {
++			"mousedown:a#1", "mouseup:a#1!cancel", "mousedown:b#1", "mouseup:b#1", "click:b#1"
++		}, "lost up");
++	}
++
++	// The held element disappears (skin reload): later events for that finger are dropped safely.
++	bool testRemovedElement()
++	{
++		Fixture f;
++		if(!check(f.valid(), "fixture"))
++			return false;
++		TouchRouter router;
++		router.down(*f.context, 1, { 150, 10 }, 0);
++		auto* b = f.document->GetElementById("b");
++		b->GetParentNode()->RemoveChild(b);
++		f.context->Update();
++		router.move(1, { 155, 10 }, 0);
++		const auto route = router.up(1, { 155, 10 }, 0);
++		return check(route == Route::Captured && router.capturedCount() == 0, "removed element handled")
++			& expectEvents(f.log, { "mousedown:b#1" }, "removed element");
++	}
++
++	bool testModifiersForwarded()
++	{
++		Fixture f;
++		if(!check(f.valid(), "fixture"))
++			return false;
++		bool sawAlt = false;
++		struct AltProbe final : Rml::EventListener
++		{
++			bool* seen = nullptr;
++			void ProcessEvent(Rml::Event& _event) override { *seen = _event.GetParameter<int>("alt_key", 0) != 0; }
++		} probe;
++		probe.seen = &sawAlt;
++		f.document->GetElementById("b")->AddEventListener(Rml::EventId::Mousedown, &probe);
++		TouchRouter router;
++		router.down(*f.context, 4, { 150, 10 }, Rml::Input::KM_ALT);
++		router.cancelAll();
++		f.document->GetElementById("b")->RemoveEventListener(Rml::EventId::Mousedown, &probe);
++		return check(sawAlt, "alt modifier forwarded");
++	}
++}
++
++int main()
++{
++	bool success = true;
++	success &= testIndependentHolds();
++	success &= testSharedControl();
++	success &= testIndependentDrags();
++	success &= testContextFinger();
++	success &= testCancel();
++	success &= testLostUp();
++	success &= testRemovedElement();
++	success &= testModifiersForwarded();
++	if(success)
++		std::puts("rmlTouchRouter_test: PASS");
++	return success ? 0 : 1;
++}

@@ -1,0 +1,23 @@
+[ 10%] Built target lua
+[ 17%] Built target baseLib
+[ 25%] Built target freetype
+[ 25%] Built target dsp56kBase
+[ 75%] Built target rmlui_core
+[ 78%] Built target rmlui_debugger
+[ 89%] Built target rmlui_lua
+[100%] Built target juceRmlUi
+[100%] Building CXX object source/juceRmlUi/CMakeFiles/juceRmlTouchRouterTest.dir/test/rmlTouchRouter_test.cpp.o
+clang++: warning: argument '-Ofast' is deprecated; use '-O3 -ffast-math' for the same behavior, or '-O3' to enable only conforming optimizations [-Wdeprecated-ofast]
+[100%] Linking CXX executable juceRmlTouchRouterTest
+[100%] Built target juceRmlTouchRouterTest
+[ 10%] Built target lua
+[ 21%] Built target baseLib
+[ 25%] Built target freetype
+[ 25%] Built target dsp56kBase
+[ 75%] Built target rmlui_core
+[ 78%] Built target rmlui_debugger
+[ 89%] Built target rmlui_lua
+[100%] Built target juceRmlUi
+[100%] Linking CXX executable juceRmlMouseInputTest
+[100%] Built target juceRmlMouseInputTest
+make: *** No rule to make target `mdFrontPanelPresentationTests'.  Stop.

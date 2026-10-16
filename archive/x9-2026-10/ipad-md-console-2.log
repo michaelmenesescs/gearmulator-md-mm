@@ -1,0 +1,14 @@
+17:17:51  Acquired tunnel connection to device.
+17:17:51  Enabling developer disk image services.
+17:17:51  Acquired usage assertion.
+ERROR: The application failed to launch. (com.apple.dt.CoreDeviceError error 10002 (0x2712))
+       BundleIdentifier = com.michaelmeneses.mzz78tc6yl.GearmulatorMD
+       ----------------------------------------
+           The request to open "com.michaelmeneses.mzz78tc6yl.GearmulatorMD" failed. (FBSOpenApplicationServiceErrorDomain error 1 (0x01))
+           NSLocalizedFailureReason = The request was denied by service delegate (SBMainWorkspace) for reason: Security ("Unable to launch com.michaelmeneses.mzz78tc6yl.GearmulatorMD because it has an invalid code signature, inadequate entitlements or its profile has not been explicitly trusted by the user").
+           FBSOpenApplicationRequestID = 0x226d
+           BSErrorCodeDescription = RequestDenied
+       ----------------------------------------
+               The operation couldn’t be completed. Unable to launch com.michaelmeneses.mzz78tc6yl.GearmulatorMD because it has an invalid code signature, inadequate entitlements or its profile has not been explicitly trusted by the user. (FBSOpenApplicationErrorDomain error 3 (0x03))
+               NSLocalizedFailureReason = Unable to launch com.michaelmeneses.mzz78tc6yl.GearmulatorMD because it has an invalid code signature, inadequate entitlements or its profile has not been explicitly trusted by the user.
+               BSErrorCodeDescription = Security

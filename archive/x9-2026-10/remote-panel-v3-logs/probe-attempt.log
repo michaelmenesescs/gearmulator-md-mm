@@ -1,0 +1,14 @@
+Traceback (most recent call last):
+  File "/Users/michaelmeneses/gearmulator-md-mm/tools/remote-panel-v3/probe.py", line 247, in <module>
+    if __name__=='__main__': main()
+  File "/Users/michaelmeneses/gearmulator-md-mm/tools/remote-panel-v3/probe.py", line 241, in main
+    probe=Probe(args)
+  File "/Users/michaelmeneses/gearmulator-md-mm/tools/remote-panel-v3/probe.py", line 80, in __init__
+    self.ws=Ws(args.host,args.port); self.decoder=Decoder(); self.seq=0; self.args=args
+  File "/Users/michaelmeneses/gearmulator-md-mm/tools/remote-panel-v3/probe.py", line 12, in __init__
+    self.s=socket.create_connection((host,port),5)
+  File "/Applications/Xcode.app/Contents/Developer/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/socket.py", line 843, in create_connection
+    raise err
+  File "/Applications/Xcode.app/Contents/Developer/Library/Frameworks/Python3.framework/Versions/3.9/lib/python3.9/socket.py", line 831, in create_connection
+    sock.connect(sa)
+PermissionError: [Errno 1] Operation not permitted

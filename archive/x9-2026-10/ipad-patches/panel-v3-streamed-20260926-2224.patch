@@ -1,0 +1,897 @@
+diff --git a/source/JUCE b/source/JUCE
+--- a/source/JUCE
++++ b/source/JUCE
+@@ -1 +1 @@
+-Subproject commit f96dadf41974b512ab0e2d13767c9b1902470dc7
++Subproject commit f96dadf41974b512ab0e2d13767c9b1902470dc7-dirty
+diff --git a/source/dsp56300 b/source/dsp56300
+--- a/source/dsp56300
++++ b/source/dsp56300
+@@ -1 +1 @@
+-Subproject commit b5ed45169ed46a38e1b49894f78b1c855a0437da
++Subproject commit b5ed45169ed46a38e1b49894f78b1c855a0437da-dirty
+diff --git a/source/elektron/md/mdJucePlugin/CMakeLists.txt b/source/elektron/md/mdJucePlugin/CMakeLists.txt
+index 31ea18d2..4879b4a5 100644
+--- a/source/elektron/md/mdJucePlugin/CMakeLists.txt
++++ b/source/elektron/md/mdJucePlugin/CMakeLists.txt
+@@ -27,6 +27,10 @@ set(SOURCES
+ 	mdProductSkinPolicy.h
+ 	mdProductSkins.h
+ 	mdPluginProcessor.cpp mdPluginProcessor.h
++	mdRemotePanel.cpp mdRemotePanel.h
++	mdRemotePanelV3.cpp
++	mdRemotePanelProtocol.h
++	mdRemotePanelServer.cpp mdRemotePanelServer.h
+ 	mdStorageImage.cpp mdStorageImage.h
+ 	mdPluginEntry.cpp
+ 
+@@ -68,9 +72,27 @@ juce_add_binary_data(mmJucePlugin_BinaryData SOURCES
+ 	${COMMON_ASSETS} "tus_settings_gui_Monomachine.rml"
+ 	"tus_settings_dspaudio_Monomachine.rml" ${MM_SKIN_ASSETS})
+ 
++# Private local iOS test builds only: optionally embed the user's own ROM in
++# the matching app bundle. Each product gets its own variable so an MD ROM can
++# never end up in the MM app or vice versa. GEARMULATOR_IOS_ROM is the legacy
++# Machinedrum-only name and is still honoured for MD.
++set(GEARMULATOR_IOS_ROM_MD "" CACHE FILEPATH "iOS only: private Machinedrum ROM to embed in a local test bundle")
++set(GEARMULATOR_IOS_ROM_MM "" CACHE FILEPATH "iOS only: private Monomachine ROM to embed in a local test bundle")
++if(NOT GEARMULATOR_IOS_ROM_MD AND GEARMULATOR_IOS_ROM)
++	set(GEARMULATOR_IOS_ROM_MD "${GEARMULATOR_IOS_ROM}")
++endif()
++
++set(iosRomFile "${GEARMULATOR_IOS_ROM_MD}")
++set(iosRomName "machinedrum.bin")
+ createJucePlugin(mdJucePlugin "Gearmulator MD" TRUE "Tmdr" mdJucePlugin_BinaryData mdLib)
++
++set(iosRomFile "${GEARMULATOR_IOS_ROM_MM}")
++set(iosRomName "monomachine.bin")
+ createJucePlugin(mmJucePlugin "Gearmulator MM" TRUE "Tmno" mmJucePlugin_BinaryData mdLib)
+ 
++unset(iosRomFile)
++unset(iosRomName)
++
+ # MD/MM expose an optional stereo input to plug-in hosts. Starting the
+ # standalone with that input active makes CoreAudio combine the built-in input
+ # and output devices on common Mac setups, which can consume the real-time
+diff --git a/source/elektron/md/mdJucePlugin/mdEditor.cpp b/source/elektron/md/mdJucePlugin/mdEditor.cpp
+index 51d7464b..ac1bf408 100644
+--- a/source/elektron/md/mdJucePlugin/mdEditor.cpp
++++ b/source/elektron/md/mdJucePlugin/mdEditor.cpp
+@@ -3,6 +3,7 @@
+ #include "mdController.h"
+ #include "mdPanelAffordances.h"
+ #include "mdPluginProcessor.h"
++#include "mdRemotePanel.h"
+ #include "mdSettingsAudioInput.h"
+ #include "mdSettingsPanelFeel.h"
+ #include "mdPixelPerfectPanel.h"
+@@ -31,6 +32,7 @@
+ #include "juceRmlUi/rmlElemKnob.h"
+ #include "juceRmlUi/rmlEventListener.h"
+ #include "juceRmlUi/rmlHelper.h"
++#include "juceRmlUi/rmlTouchRouter.h"
+ #include "juceRmlUi/juceRmlComponent.h"
+ 
+ #include "RmlUi/Core/Element.h"
+@@ -87,6 +89,10 @@ namespace mdJucePlugin
+ 		// Arbitrary endless-knob value range; only per-move deltas are used.
+ 		constexpr float g_encoderRange = 100.0f;
+ 		constexpr int g_encoderBurstCap = 8;	// max ±1 events emitted per Change
++		// Touch: holding an encoder this long without moving presses it; moving further
++		// than the slop (in document pixels) first makes the gesture a plain turn.
++		constexpr double g_touchEncoderHoldMilliseconds = 400.0;
++		constexpr float g_touchEncoderHoldSlop = 10.0f;
+ 		constexpr int g_presentationTimerId = 1;
+ 		constexpr int g_panelTimerId = 2;
+ 		constexpr int g_presentationTimerIntervalMilliseconds = 16;
+@@ -147,6 +153,8 @@ namespace mdJucePlugin
+ 
+ 	Editor::~Editor()
+ 	{
++		if(auto* remote = dynamic_cast<const AudioPluginAudioProcessor&>(getProcessor()).getRemotePanel())
++			remote->detachEditor(this);
+ 		juce::Desktop::getInstance().removeFocusChangeListener(this);
+ 		m_panelSteps.clear();
+ 		cancelPanelInputGestures();
+@@ -171,6 +179,15 @@ namespace mdJucePlugin
+ 		auto& diagnostics = plugin.getRealtimeInstrumentation();
+ 		const auto model = static_cast<uint32_t>(getModel());
+ 		const auto token = diagnostics.beginPanelInput(model, _command, _argument);
++		// Scan rows are shared with remote touch panels: merge there so neither side
++		// releases a bit the other still holds. Encoder pulses need no merging.
++		auto* const remote = dynamic_cast<const AudioPluginAudioProcessor&>(getProcessor()).getRemotePanel();
++		if(remote && RemotePanel::isRowCommand(_command))
++		{
++			const auto merged = remote->submitEditorRow(_command, _argument);
++			diagnostics.endPanelInput(token, model, _command, _argument, merged);
++			return merged;
++		}
+ 		const auto accepted = plugin.withDeviceLocked(
+ 			[&](synthLib::Device* const _device)
+ 			{
+@@ -225,6 +242,7 @@ namespace mdJucePlugin
+ 		m_lcdInteractionInputChanged = !m_frontPanelSnapshotValid || m_lcdChanged
+ 			|| lcdInteraction::classificationLedsChanged(
+ 				m_frontPanelSnapshot, published.panel, getModel());
++		m_remoteLedSequence = published.ledSequence;
+ 		m_frontPanelSnapshot = std::move(published.panel);
+ 
+ 		if(m_ledResyncPending && published.ledSequence >= m_ledResyncSequence)
+@@ -286,6 +304,8 @@ namespace mdJucePlugin
+ 		createLeds();
+ 		createPanelAffordances();
+ 		applyPixelPerfectPanel();
++		if(auto* remote = dynamic_cast<const AudioPluginAudioProcessor&>(getProcessor()).getRemotePanel())
++			remote->attachEditor(this);
+ 
+ 		// A transfer belongs to the emulated machine, not the lifetime of one
+ 		// editor window. Reattach progress monitoring after a reopen, or reclaim a
+@@ -329,6 +349,7 @@ namespace mdJucePlugin
+ 		m_lcdCanvas = juceRmlUi::ElemCanvas::create(lcdArea);
+ 		m_lcdCanvas->setClearEveryFrame(true);
+ 		m_lcdCanvas->SetProperty(Rml::PropertyId::Drag, Rml::Style::Drag::Drag);
++		juceRmlUi::TouchRouter::setTouchCapture(m_lcdCanvas);
+ 		m_lcdCanvas->setRepaintGraphicsCallback([this](const juce::Image& _image, juce::Graphics& _g)
+ 		{
+ 			paintLcd(_image, _g);
+@@ -347,8 +368,8 @@ namespace mdJucePlugin
+ 				if(!target)
+ 					return;
+ 				const auto mouse = juceRmlUi::helper::getMousePos(_event);
+-				(void)m_lcdDragGesture.begin(*m_lcdInteractionState, *target,
+-					mouse.x, mouse.y);
++				if(m_lcdDragGesture.begin(*m_lcdInteractionState, *target, mouse.x, mouse.y))
++					m_lcdGestureTouch = juceRmlUi::TouchRouter::getTouchId(_event);
+ 				// RmlUi arms its drag source only after mousedown propagation completes.
+ 				// Stopping this event prevents every subsequent Drag event.
+ 			});
+@@ -489,6 +510,7 @@ namespace mdJucePlugin
+ 	void Editor::cancelLcdGesture()
+ 	{
+ 		m_lcdDragGesture.cancel();
++		m_lcdGestureTouch = -1;
+ 	}
+ 
+ 	void Editor::applyPixelPerfectPanel()
+@@ -526,6 +548,11 @@ namespace mdJucePlugin
+ 				continue;
+ 			}
+ 
++			b->SetAttribute("remote-slot", static_cast<int>(pb.control));
++
++			// Every panel switch is held by its own finger.
++			juceRmlUi::TouchRouter::setTouchCapture(b);
++
+ 			// On the hardware, A/E through D/H are held while a trig key chooses the
+ 			// pattern number. A normal MM bank click therefore keeps its existing latch.
+ 			// When another Shift-held control is active, the bank acts as an ordinary
+@@ -584,7 +611,7 @@ namespace mdJucePlugin
+ 			juceRmlUi::EventListener::Add(document, Rml::EventId::Keyup,
+ 				[this](const Rml::Event& _event)
+ 				{
+-					if(!juceRmlUi::helper::getKeyModAlt(_event))
++					if(!juceRmlUi::helper::getKeyModAlt(_event) && m_encoderPressTouch < 0)
+ 						releaseEncoderPress();
+ 					if(_event.GetParameter<int>("shift_key", 0) == 0
+ 						&& !m_shiftPanelLatch.empty())
+@@ -601,20 +628,29 @@ namespace mdJucePlugin
+ 					_event.StopPropagation();
+ 					cancelPanelInputGestures();
+ 				});
++			// Only the pointer that started a gesture ends it: with several fingers
++			// down, every other finger's release bubbles up here as well.
+ 			juceRmlUi::EventListener::Add(document, Rml::EventId::Mouseup,
+ 				[this](Rml::Event& _event)
+ 				{
+-					if(juceRmlUi::helper::getMouseButton(_event) == juceRmlUi::MouseButton::Left)
+-					{
++					if(juceRmlUi::helper::getMouseButton(_event) != juceRmlUi::MouseButton::Left)
++						return;
++					const auto touch = juceRmlUi::TouchRouter::getTouchId(_event);
++					if(m_touchEncoderHold && m_touchEncoderHold->touch == touch)
++						m_touchEncoderHold.reset();
++					if(touch == m_encoderPressTouch)
+ 						releaseEncoderPress();
++					if(touch == m_lcdGestureTouch)
+ 						cancelLcdGesture();
+-					}
+ 				});
+ 			juceRmlUi::EventListener::Add(document, Rml::EventId::Dragend,
+ 				[this](Rml::Event&)
+ 				{
+-					releaseEncoderPress();
+-					cancelLcdGesture();
++					// RmlUi drags come from the mouse, never from a captured finger.
++					if(m_encoderPressTouch < 0)
++						releaseEncoderPress();
++					if(m_lcdGestureTouch < 0)
++						cancelLcdGesture();
+ 				});
+ 		}
+ 	}
+@@ -692,6 +728,7 @@ namespace mdJucePlugin
+ 			if(!element)
+ 				return;
+ 			element->SetClass(panelAffordances::g_affordanceClass, true);
++			juceRmlUi::TouchRouter::setTouchCapture(element);
+ 			juceRmlUi::EventListener::Add(element, Rml::EventId::Click, [this, _select](Rml::Event&)
+ 			{
+ 				releasePanelButtonGestures();
+@@ -746,6 +783,7 @@ namespace mdJucePlugin
+ 			return;
+ 
+ 		element->SetClass(panelAffordances::g_affordanceClass, true);
++		juceRmlUi::TouchRouter::setTouchCapture(element);
+ 		juceRmlUi::EventListener::Add(element, Rml::EventId::Mousedown,
+ 			[this, element, _control](Rml::Event&)
+ 		{
+@@ -764,6 +802,7 @@ namespace mdJucePlugin
+ 			return;
+ 
+ 		element->SetClass(panelAffordances::g_affordanceClass, true);
++		juceRmlUi::TouchRouter::setTouchCapture(element);
+ 		juceRmlUi::EventListener::Add(element, Rml::EventId::Mousedown,
+ 			[this, element, _control](Rml::Event&)
+ 		{
+@@ -863,6 +902,8 @@ namespace mdJucePlugin
+ 		if(m_pressedEncoder)
+ 			m_pressedEncoder->SetClass("encoderPressed", false);
+ 		m_pressedEncoder = nullptr;
++		m_encoderPressTouch = -1;
++		m_touchEncoderHold.reset();
+ 		if(wasActive)
+ 		{
+ 			// The held-switch state is a classifier input. Restore hit targets
+@@ -872,6 +913,53 @@ namespace mdJucePlugin
+ 		}
+ 	}
+ 
++	void Editor::beginEncoderPress(juceRmlUi::ElemKnob* const _knob,
++		const std::optional<md::PanelPacket>& _packet, const bool _left, const bool _alt, const int _touch)
++	{
++		if(!m_encoderPress.begin(_packet, _left, _alt))
++			return;
++
++		// Suppress LCD hit targets immediately, before firmware has time
++		// to draw the held-value overlay on the next presentation tick.
++		m_lcdInteractionInputChanged = true;
++		updateLcdInteractionState();
++		m_pressedEncoder = _knob;
++		m_encoderPressTouch = _touch;
++		_knob->SetClass("encoderPressed", true);
++		const auto combined = m_panelRows.press(*_packet);
++		(void)sendPanelEvent(combined.row, combined.mask);
++	}
++
++	bool Editor::isTouchHeld(const int _touch) const
++	{
++		const auto* rml = getRmlComponent();
++		return rml && rml->getTouchRouter().isCaptured(_touch);
++	}
++
++	void Editor::serviceTouchEncoderHold(const double _nowMilliseconds)
++	{
++		// The press is owned by a finger: it ends with that finger, nothing else.
++		if(m_encoderPress.active() && m_encoderPressTouch >= 0 && !isTouchHeld(m_encoderPressTouch))
++			releaseEncoderPress();
++
++		if(!m_touchEncoderHold)
++			return;
++
++		const auto hold = *m_touchEncoderHold;
++		if(!isTouchHeld(hold.touch))
++		{
++			m_touchEncoderHold.reset();
++			return;
++		}
++		if(_nowMilliseconds - hold.startMilliseconds < g_touchEncoderHoldMilliseconds)
++			return;
++
++		m_touchEncoderHold.reset();
++		// One encoder press at a time, as with the mouse; the newest hold wins.
++		releaseEncoderPress();
++		beginEncoderPress(hold.knob, hold.packet, true, true, hold.touch);
++	}
++
+ 	void Editor::globalFocusChanged(juce::Component* const _focusedComponent)
+ 	{
+ 		auto* const panel = getRmlComponent();
+@@ -1763,6 +1851,8 @@ namespace mdJucePlugin
+ 		if(!_knob)
+ 			return;
+ 
++		_knob->SetAttribute("remote-slot", 64 + static_cast<int>(_encoder));
++
+ 		// Shift belongs to the MD/MM panel-hold gesture. Keep normal drag speed
+ 		// while it is down; Command/Ctrl remains the fine-adjustment modifier.
+ 		_knob->SetAttribute("speedScaleShift", 1.0f);
+@@ -1773,21 +1863,32 @@ namespace mdJucePlugin
+ 			juceRmlUi::EventListener::Add(_knob, Rml::EventId::Mousedown,
+ 				[this, _knob, packet](Rml::Event& _event)
+ 				{
++					const auto touch = juceRmlUi::TouchRouter::getTouchId(_event);
++					if(touch >= 0)
++					{
++						// Leave any press held by another finger alone; this finger
++						// presses only once it has rested here long enough.
++						const auto mouse = juceRmlUi::helper::getMousePos(_event);
++						m_touchEncoderHold = TouchEncoderHold{ _knob, packet, touch, mouse.x, mouse.y,
++							juce::Time::getMillisecondCounterHiRes() };
++						return;
++					}
+ 					releaseEncoderPress();
+-					if(m_encoderPress.begin(packet,
++					beginEncoderPress(_knob, packet,
+ 						juceRmlUi::helper::getMouseButton(_event) == juceRmlUi::MouseButton::Left
+ 							&& !juceRmlUi::helper::isContextMenu(_event),
+-						juceRmlUi::helper::getKeyModAlt(_event)))
+-					{
+-						// Suppress LCD hit targets immediately, before firmware has time
+-						// to draw the held-value overlay on the next presentation tick.
+-						m_lcdInteractionInputChanged = true;
+-						updateLcdInteractionState();
+-						m_pressedEncoder = _knob;
+-						_knob->SetClass("encoderPressed", true);
+-						const auto combined = m_panelRows.press(*packet);
+-						(void)sendPanelEvent(combined.row, combined.mask);
+-					}
++						juceRmlUi::helper::getKeyModAlt(_event), -1);
++				});
++			juceRmlUi::EventListener::Add(_knob, Rml::EventId::Drag,
++				[this, _knob](Rml::Event& _event)
++				{
++					if(!m_touchEncoderHold || m_touchEncoderHold->knob != _knob
++						|| m_touchEncoderHold->touch != juceRmlUi::TouchRouter::getTouchId(_event))
++						return;
++					const auto mouse = juceRmlUi::helper::getMousePos(_event);
++					if(std::abs(mouse.x - m_touchEncoderHold->x) + std::abs(mouse.y - m_touchEncoderHold->y)
++						> g_touchEncoderHoldSlop)
++						m_touchEncoderHold.reset();
+ 				});
+ 		}
+ 		_knob->setMinValue(0.0f);
+@@ -2057,8 +2158,10 @@ namespace mdJucePlugin
+ 
+ 		const auto nowMilliseconds = juce::Time::getMillisecondCounterHiRes();
+ 		const auto modifiers = juce::ModifierKeys::getCurrentModifiersRealtime();
+-		if(m_encoderPress.active() && (!modifiers.isAltDown() || !modifiers.isLeftButtonDown()))
++		if(m_encoderPress.active() && m_encoderPressTouch < 0
++			&& (!modifiers.isAltDown() || !modifiers.isLeftButtonDown()))
+ 			releaseEncoderPress();
++		serviceTouchEncoderHold(nowMilliseconds);
+ 		// Some plugin hosts can lose the modifier key-up when focus changes. Poll
+ 		// native state as a fail-safe so no panel row remains held indefinitely.
+ 		if(!m_shiftPanelLatch.empty()
+diff --git a/source/elektron/md/mdJucePlugin/mdEditor.h b/source/elektron/md/mdJucePlugin/mdEditor.h
+index fbed293e..6542ae13 100644
+--- a/source/elektron/md/mdJucePlugin/mdEditor.h
++++ b/source/elektron/md/mdJucePlugin/mdEditor.h
+@@ -90,6 +90,8 @@ namespace mdJucePlugin
+ 
+ 	private:
+ 		friend struct EditorIdentityTestAccess;
++		friend class RemotePanel;
++		uint64_t m_remoteLedSequence = 0;
+ 
+ 		void timerCallback(int _timerId) override;
+ 
+@@ -118,6 +120,10 @@ namespace mdJucePlugin
+ 		void endPanelGesture();
+ 		void releasePanelButtonGestures();
+ 		void releaseEncoderPress();
++		void beginEncoderPress(juceRmlUi::ElemKnob* _knob, const std::optional<md::PanelPacket>& _packet,
++			bool _left, bool _alt, int _touch);
++		void serviceTouchEncoderHold(double _nowMilliseconds);
++		bool isTouchHeld(int _touch) const;
+ 		void cancelPanelInputGestures();
+ 		void releaseAllPanelInputs();
+ 		void globalFocusChanged(juce::Component* _focusedComponent) override;
+@@ -195,6 +201,23 @@ namespace mdJucePlugin
+ 		panelAffordances::EncoderPressGesture m_encoderPress;
+ 		juceRmlUi::ElemKnob* m_pressedEncoder = nullptr;
+ 
++		// Finger that owns the encoder press / LCD drag, or -1 for the mouse. Other
++		// fingers lifting must not end them (see juceRmlUi::TouchRouter).
++		int m_encoderPressTouch = -1;
++		int m_lcdGestureTouch = -1;
++
++		// Fingers have no Alt key: an encoder held still for a moment is pressed.
++		struct TouchEncoderHold
++		{
++			juceRmlUi::ElemKnob* knob = nullptr;
++			std::optional<md::PanelPacket> packet;
++			int touch = -1;
++			float x = 0.0f;
++			float y = 0.0f;
++			double startMilliseconds = 0.0;
++		};
++		std::optional<TouchEncoderHold> m_touchEncoderHold;
++
+ 		struct ActivePanelButton
+ 		{
+ 			juceRmlUi::ElemButton* button = nullptr;
+diff --git a/source/elektron/md/mdJucePlugin/mdPluginProcessor.cpp b/source/elektron/md/mdJucePlugin/mdPluginProcessor.cpp
+index 2a03875a..06e118db 100644
+--- a/source/elektron/md/mdJucePlugin/mdPluginProcessor.cpp
++++ b/source/elektron/md/mdJucePlugin/mdPluginProcessor.cpp
+@@ -2,6 +2,7 @@
+ 
+ #include "mdController.h"
+ #include "mdPluginEditorState.h"
++#include "mdRemotePanel.h"
+ #include "mdStorageImage.h"
+ 
+ // ReSharper disable once CppUnusedIncludeDirective
+@@ -20,6 +21,7 @@
+ #include "juce_audio_utils/juce_audio_utils.h"
+ #include "juce_audio_plugin_client/Standalone/juce_StandaloneFilterWindow.h"
+ 
++#include <cstdlib>
+ #include <memory>
+ #include <utility>
+ 
+@@ -423,6 +425,39 @@ namespace mdJucePlugin
+ 		// The environment switch is also useful in hosts without an open editor.
+ 		if(getPlugin().getRealtimeInstrumentation().isEnabled())
+ 			setPerformanceDiagnosticsEnabled(true);
++
++		// LAN touch panel for the iPad. Only real (non-test) instances listen.
++		const auto* const remoteEnv = std::getenv("GM_REMOTE_PANEL");
++		const bool remoteWanted = !(remoteEnv && std::string(remoteEnv) == "0")
++			&& getConfig().getBoolValue("remotePanelEnabled", true);
++		if(_allowMcpServer && !_ephemeralConfig && remoteWanted)
++		{
++			RemotePanel::Config config;
++			const bool isMonomachine = m_model == md::MachineModel::Monomachine;
++			config.port = static_cast<uint16_t>(getConfig().getIntValue("remotePanelPort",
++				isMonomachine ? 7800 : 7788));
++			const auto* const webEnv = std::getenv("GM_REMOTE_PANEL_WEB");
++			const auto defaultWeb = juce::File::getSpecialLocation(juce::File::userHomeDirectory)
++				.getChildFile("gearmulator-ipad-panel").getChildFile("web").getFullPathName();
++			config.webRoot = webEnv ? std::string(webEnv)
++				: getConfig().getValue("remotePanelWebRoot", defaultWeb).toStdString();
++			const auto logFolder = performanceDiagnosticsFolder();
++			if(logFolder.createDirectory().wasOk())
++				config.logFile = logFolder.getChildFile(isMonomachine
++					? "remote-panel-MM.log" : "remote-panel-MD.log").getFullPathName().toStdString();
++			m_remotePanel = std::make_unique<RemotePanel>(getPlugin(), m_model, std::move(config));
++			if(!m_remotePanel->isRunning())
++				m_remotePanel.reset();
++		}
++	}
++
++	void AudioPluginAudioProcessor::onAudioRendered(const synthLib::TAudioOutputs& _outputs,
++		const size_t _numSamples, const std::chrono::steady_clock::time_point _callbackStart)
++	{
++		if(m_remotePanel)
++			m_remotePanel->processAudio(_outputs[0], _outputs[1], static_cast<int>(_numSamples),
++				getSampleRate(), static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
++					_callbackStart.time_since_epoch()).count()));
+ 	}
+ 
+ 	juce::AudioProcessor::BusesProperties AudioPluginAudioProcessor::createBusesProperties()
+@@ -440,6 +475,8 @@ namespace mdJucePlugin
+ 
+ 	AudioPluginAudioProcessor::~AudioPluginAudioProcessor()
+ 	{
++		// Releases every remote hold while the device still exists.
++		m_remotePanel.reset();
+ 		stopTimer();
+ 		m_performanceReport.reset();
+ 		destroyEditorState();
+diff --git a/source/elektron/md/mdJucePlugin/mdPluginProcessor.h b/source/elektron/md/mdJucePlugin/mdPluginProcessor.h
+index a6a163e8..600ab53c 100644
+--- a/source/elektron/md/mdJucePlugin/mdPluginProcessor.h
++++ b/source/elektron/md/mdJucePlugin/mdPluginProcessor.h
+@@ -5,6 +5,8 @@
+ #include "synthLib/performanceReport.h"
+ 
+ #include <atomic>
++#include <chrono>
++#include <memory>
+ #include <optional>
+ #include <string>
+ #include <string_view>
+@@ -13,6 +15,8 @@
+ 
+ namespace mdJucePlugin
+ {
++	class RemotePanel;
++
+ 	class AudioPluginAudioProcessor : public jucePluginEditorLib::Processor,
+ 		private juce::Timer
+ 	{
+@@ -55,6 +59,9 @@ namespace mdJucePlugin
+ 				m_ramRecordingMode.load(std::memory_order_relaxed));
+ 		}
+ 		bool isRamRecordingModeAvailable();
++		// LAN touch panel (iPad); null when disabled or for test/ephemeral instances.
++		RemotePanel* getRemotePanel() const { return m_remotePanel.get(); }
++
+ 
+ 	    jucePluginEditorLib::PluginEditorState* createEditorState() override;
+ 	    synthLib::Device* createDevice() override;
+@@ -77,6 +84,8 @@ namespace mdJucePlugin
+ 		void recordStandaloneStartupDiagnostics();
+ 		void reportProjectStateRestoreFailure(const std::string& _error);
+ 		void timerCallback() override;
++		void onAudioRendered(const synthLib::TAudioOutputs& _outputs, size_t _numSamples,
++			std::chrono::steady_clock::time_point _callbackStart) override;
+ 
+ 		std::unique_ptr<synthLib::PerformanceReport> m_performanceReport;
+ 		juce::File m_performanceReportFile;
+@@ -92,6 +101,7 @@ namespace mdJucePlugin
+ 		std::atomic<uint8_t> m_ramRecordingMode{
+ 			static_cast<uint8_t>(md::RamRecordingMode::Original)};
+ 		bool m_ramRecordingModeChunkSeen = false;
++		std::unique_ptr<RemotePanel> m_remotePanel;
+ 		JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(AudioPluginAudioProcessor)
+ 	};
+ }
+diff --git a/source/juce.cmake b/source/juce.cmake
+index fefd123e..815afa91 100644
+--- a/source/juce.cmake
++++ b/source/juce.cmake
+@@ -1,6 +1,8 @@
+ option(${CMAKE_PROJECT_NAME}_BUILD_JUCEPLUGIN "Build Juce plugins" on)
+ set(GEARMULATOR_BUNDLE_ID_PREFIX "local.gearmulator.preview" CACHE STRING
+ 	"Bundle identifier prefix; override for personal iOS development signing")
++set(GEARMULATOR_IOS_DISPLAY_NAME_SUFFIX "" CACHE STRING
++	"iOS only: appended to the home-screen name, e.g. to tell a JIT test variant apart")
+ option(${CMAKE_PROJECT_NAME}_BUILD_FX_PLUGIN "Build FX plugin variants" off)
+ 
+ option(${CMAKE_PROJECT_NAME}_BUILD_JUCEPLUGIN_VST2 "Build VST2 version of Juce plugins" on)
+@@ -126,7 +128,12 @@ endmacro()
+ 
+ macro(createJucePlugin targetName productName isSynth plugin4CC binaryDataProject synthLibProject)
+ 	string(REPLACE " " "" productNameIdentifier "${productName}")
++	set(iosPlistToMerge)
++	if(CMAKE_SYSTEM_NAME STREQUAL "iOS" AND GEARMULATOR_IOS_DISPLAY_NAME_SUFFIX)
++		set(iosPlistToMerge PLIST_TO_MERGE "<plist><dict><key>CFBundleDisplayName</key><string>${productName}${GEARMULATOR_IOS_DISPLAY_NAME_SUFFIX}</string></dict></plist>")
++	endif()
+ 	juce_add_plugin(${targetName}
++		${iosPlistToMerge}
+ 		# VERSION ...                                     # Set this if the plugin version is different to the project version
+ 		# ICON_BIG ...                                    # ICON_* arguments specify a path to an image file to use as an icon for the Standalone
+ 		# ICON_SMALL ...
+@@ -153,11 +160,10 @@ macro(createJucePlugin targetName productName isSynth plugin4CC binaryDataProjec
+ 		IPHONE_SCREEN_ORIENTATIONS                        # The Machinedrum/Monomachine skins are landscape (1252x648); portrait
+ 			UIInterfaceOrientationLandscapeLeft            # cannot fit them at a usable scale, so iPhone is locked to landscape.
+ 			UIInterfaceOrientationLandscapeRight
+-		IPAD_SCREEN_ORIENTATIONS
+-			UIInterfaceOrientationPortrait
+-			UIInterfaceOrientationPortraitUpsideDown
++		IPAD_SCREEN_ORIENTATIONS                          # iPad too: portrait would shrink the panel to ~65% of the landscape fit
+ 			UIInterfaceOrientationLandscapeLeft
+ 			UIInterfaceOrientationLandscapeRight
++		REQUIRES_FULL_SCREEN TRUE                         # iPad: landscape-only needs opting out of Split View/Slide Over
+ 	)
+ 
+ 	if(CMAKE_SYSTEM_NAME STREQUAL "iOS" AND TARGET ${targetName}_Standalone)
+@@ -168,12 +174,14 @@ macro(createJucePlugin targetName productName isSynth plugin4CC binaryDataProjec
+ 
+ 	# Private local testing only. The ROM is never copied unless the caller
+ 	# explicitly supplies its path; release builds should use Files import.
+-	if(CMAKE_SYSTEM_NAME STREQUAL "iOS" AND GEARMULATOR_IOS_ROM AND EXISTS "${GEARMULATOR_IOS_ROM}")
++	# The caller selects the ROM per target by setting iosRomFile/iosRomName
++	# before invoking this macro, so each product only ever embeds its own ROM.
++	if(CMAKE_SYSTEM_NAME STREQUAL "iOS" AND iosRomFile AND EXISTS "${iosRomFile}")
+ 		add_custom_command(TARGET ${targetName}_Standalone POST_BUILD
+ 			COMMAND ${CMAKE_COMMAND} -E copy_if_different
+-				"${GEARMULATOR_IOS_ROM}"
+-				"$<TARGET_BUNDLE_DIR:${targetName}_Standalone>/machinedrum.bin"
+-			COMMENT "Copying explicitly supplied private Machinedrum ROM into local iOS test bundle")
++				"${iosRomFile}"
++				"$<TARGET_BUNDLE_DIR:${targetName}_Standalone>/${iosRomName}"
++			COMMENT "Copying explicitly supplied private ROM into local iOS test bundle as ${iosRomName}")
+ 	endif()
+ 
+ 	# JUCE otherwise puts the internal SharedCode archive beside the final plug-in
+diff --git a/source/jucePluginLib/processor.cpp b/source/jucePluginLib/processor.cpp
+index f3b70c65..f0d593bc 100644
+--- a/source/jucePluginLib/processor.cpp
++++ b/source/jucePluginLib/processor.cpp
+@@ -16,6 +16,7 @@
+ 
+ #include "client/remoteDevice.h"
+ 
++#include "synthLib/callbackCapture.h"
+ #include "synthLib/deviceException.h"
+ #include "synthLib/os.h"
+ #include "synthLib/midiBufferParser.h"
+@@ -666,6 +667,8 @@ namespace pluginLib
+ 	//==============================================================================
+ 	void Processor::prepareToPlay(double sampleRate, int samplesPerBlock)
+ 	{
++		if(synthLib::callbackCapture::isEnabled())
++			synthLib::callbackCapture::logInfo(("prepareToPlay sampleRate=" + std::to_string(sampleRate) + " samplesPerBlock=" + std::to_string(samplesPerBlock)).c_str());
+ 		// Use this method as the place to do any pre-playback
+ 		// initialisation that you need
+ 		m_hostSamplerate = static_cast<float>(sampleRate);
+@@ -775,7 +778,9 @@ namespace pluginLib
+ 	void Processor::processBlock(juce::AudioBuffer<float>& buffer, juce::MidiBuffer& midiMessages)
+ 	{
+ 	    juce::ScopedNoDenormals noDenormals;
++		const auto callbackStart = std::chrono::steady_clock::now();
+ 	    const int numSamples = buffer.getNumSamples();
++		synthLib::callbackCapture::Scope fullCapture(static_cast<size_t>(numSamples), getSampleRate());
+ 		synthLib::RealtimeInstrumentation::CallbackScope instrumentation(
+ 			getPlugin().getRealtimeInstrumentation(), static_cast<size_t>(numSamples),
+ 			getSampleRate());
+@@ -900,6 +905,7 @@ namespace pluginLib
+ 		getPlugin().process(inputs, outputs, numSamples, bpm, ppqPos, isPlaying, ppqKnown);
+ 
+ 		applyOutputGain(outputs, numSamples);
++		onAudioRendered(outputs, static_cast<size_t>(numSamples), callbackStart);
+ 
+ 		m_midiOut.clear();
+ 		getPlugin().getMidiOut(m_midiOut);
+diff --git a/source/jucePluginLib/processor.h b/source/jucePluginLib/processor.h
+index 50a91dda..9c7527a8 100644
+--- a/source/jucePluginLib/processor.h
++++ b/source/jucePluginLib/processor.h
+@@ -3,6 +3,7 @@
+ #include <juce_audio_processors/juce_audio_processors.h>
+ 
+ #include <atomic>
++#include <chrono>
+ #include <mutex>
+ 
+ #include "bypassBuffer.h"
+@@ -203,6 +204,10 @@ namespace pluginLib
+ 	protected:
+ 		void destroyController();
+ 		void handleAsyncUpdate() override;
++		// Audio thread, after the device rendered and output gain was applied. Must be
++		// realtime-safe. _callbackStart was taken on entry to processBlock.
++		virtual void onAudioRendered(const synthLib::TAudioOutputs&, size_t /*_numSamples*/,
++			std::chrono::steady_clock::time_point /*_callbackStart*/) {}
+ 
+ 	private:
+ 		void prepareToPlay(double sampleRate, int maximumExpectedSamplesPerBlock) override;
+diff --git a/source/juceRmlUi/CMakeLists.txt b/source/juceRmlUi/CMakeLists.txt
+index 8cd21f66..0f794fef 100644
+--- a/source/juceRmlUi/CMakeLists.txt
++++ b/source/juceRmlUi/CMakeLists.txt
+@@ -41,6 +41,7 @@ set(SOURCES
+ 	rmlRendererJuce.cpp rmlRendererJuce.h
+ 	rmlShaders.h
+ 	rmlSystemInterface.cpp rmlSystemInterface.h
++	rmlTouchRouter.cpp rmlTouchRouter.h
+ 	rmlTree.cpp rmlTree.h
+ 	rmlTreeNode.cpp rmlTreeNode.h
+ 
+@@ -122,4 +123,9 @@ if(BUILD_TESTING)
+ 	target_link_libraries(juceRmlMouseInputTest PRIVATE juceRmlUi)
+ 	set_property(TARGET juceRmlMouseInputTest PROPERTY FOLDER "juceRmlUi/test")
+ 	add_test(NAME juceRmlMouseInputTest COMMAND juceRmlMouseInputTest)
++
++	add_executable(juceRmlTouchRouterTest test/rmlTouchRouter_test.cpp)
++	target_link_libraries(juceRmlTouchRouterTest PRIVATE juceRmlUi)
++	set_property(TARGET juceRmlTouchRouterTest PROPERTY FOLDER "juceRmlUi/test")
++	add_test(NAME juceRmlTouchRouterTest COMMAND juceRmlTouchRouterTest)
+ endif()
+diff --git a/source/juceRmlUi/juceRmlComponent.cpp b/source/juceRmlUi/juceRmlComponent.cpp
+index dde8236c..64044acf 100644
+--- a/source/juceRmlUi/juceRmlComponent.cpp
++++ b/source/juceRmlUi/juceRmlComponent.cpp
+@@ -536,6 +536,30 @@ namespace juceRmlUi
+ 		if (isVisible() && m_metalContext)
+ 			attachMetalContext();
+ #endif
++
++		// A hidden panel never receives the matching touch-ups.
++		if (!isVisible())
++			cancelTouches();
++	}
++
++	bool RmlComponent::isTouch(const juce::MouseEvent& _event)
++	{
++		return _event.source.isTouch() || _event.source.isPen();
++	}
++
++	void RmlComponent::cancelTouches()
++	{
++		if (!m_rmlContext)
++			return;
++
++		RmlInterfaces::ScopedAccess access(*this);
++
++		if (m_touchRouter.cancelAll())
++		{
++			m_rmlContext->ProcessMouseButtonUp(0, 0);
++			m_rmlContext->ProcessMouseLeave();
++		}
++		enqueueUpdate();
+ 	}
+ 
+ 	void RmlComponent::mouseDown(const juce::MouseEvent& _event)
+@@ -547,6 +571,17 @@ namespace juceRmlUi
+ 		// in sync here as well as in mouseMove(), because a resize/display-scale
+ 		// change can otherwise leave the first click using stale coordinates.
+ 		const auto pos = toRmlPosition(_event);
++
++		// Fingers are routed individually so that several can hold controls at once,
++		// see TouchRouter. Only a finger it hands back uses the context mouse.
++		if (isTouch(_event) && m_touchRouter.down(*m_rmlContext, _event.source.getIndex(),
++			{ pos.x, pos.y }, toRmlModifiers(_event)) != TouchRouter::Route::Context)
++		{
++			logPointerDiagnostic("touchdown", _event, pos);
++			enqueueUpdate();
++			return;
++		}
++
+ 		mouseInput::processButtonDown(*m_rmlContext, { pos.x, pos.y },
+ 			static_cast<int>(helper::toRmlMouseButton(_event)), toRmlModifiers(_event));
+ 		logPointerDiagnostic("down", _event, pos);
+@@ -558,6 +593,21 @@ namespace juceRmlUi
+ 		Component::mouseUp(_event);
+ 		RmlInterfaces::ScopedAccess access(*this);
+ 		const auto pos = toRmlPosition(_event);
++
++		if (isTouch(_event))
++		{
++			if (m_touchRouter.up(_event.source.getIndex(), { pos.x, pos.y }, toRmlModifiers(_event))
++				== TouchRouter::Route::Context)
++			{
++				// Fingers do not hover. Leaving the context mouse parked over the
++				// released element would send it a late Mouseout later on.
++				mouseInput::processButtonUp(*m_rmlContext, { pos.x, pos.y }, 0, toRmlModifiers(_event));
++				m_rmlContext->ProcessMouseLeave();
++			}
++			enqueueUpdate();
++			return;
++		}
++
+ 		mouseInput::processButtonUp(*m_rmlContext, { pos.x, pos.y },
+ 			static_cast<int>(helper::toRmlMouseButton(_event)), toRmlModifiers(_event));
+ 		enqueueUpdate();
+@@ -566,6 +616,12 @@ namespace juceRmlUi
+ 	void RmlComponent::mouseMove(const juce::MouseEvent& _event)
+ 	{
+ 		Component::mouseMove(_event);
++
++		// A finger only moves while it is down (mouseDrag). JUCE's synthetic
++		// pre-touch move must not move the context mouse away from another finger.
++		if (isTouch(_event))
++			return;
++
+ 		RmlInterfaces::ScopedAccess access(*this);
+ 
+ 		const auto pos = toRmlPosition(_event);
+@@ -581,6 +637,13 @@ namespace juceRmlUi
+ 
+ 		const auto pos = toRmlPosition(_event);
+ 
++		if (isTouch(_event) && m_touchRouter.move(_event.source.getIndex(), { pos.x, pos.y },
++			toRmlModifiers(_event)) != TouchRouter::Route::Context)
++		{
++			enqueueUpdate();
++			return;
++		}
++
+ 		m_rmlContext->ProcessMouseMove(pos.x, pos.y, toRmlModifiers(_event));
+ 
+ 		// forward out-of-bounds drag events to the drag handler to allow it to convert to a juce drag if the drag source can export files
+@@ -593,6 +656,12 @@ namespace juceRmlUi
+ 	void RmlComponent::mouseExit(const juce::MouseEvent& _event)
+ 	{
+ 		Component::mouseExit(_event);
++
++		// Touch hover is cleared on touch-up; a finger leaving must not unhover the
++		// element that another finger is using through the context.
++		if (isTouch(_event))
++			return;
++
+ 		RmlInterfaces::ScopedAccess access(*this);
+ 		if (m_rmlContext)
+ 			m_rmlContext->ProcessMouseLeave();
+@@ -603,6 +672,10 @@ namespace juceRmlUi
+ 	void RmlComponent::mouseEnter(const juce::MouseEvent& _event)
+ 	{
+ 		Component::mouseEnter(_event);
++
++		if (isTouch(_event))
++			return;
++
+ 		RmlInterfaces::ScopedAccess access(*this);
+ 
+ 		const auto pos = toRmlPosition(_event);
+@@ -1321,6 +1394,10 @@ namespace juceRmlUi
+ 
+ 	void RmlComponent::destroyRmlContext()
+ 	{
++		// No events here: listeners may belong to an owner that is already being
++		// torn down. The elements themselves are about to go away.
++		m_touchRouter.forgetAll();
++
+ 		{
+ 			std::scoped_lock lock(m_timerMutex);
+ 			stopTimer();
+diff --git a/source/juceRmlUi/juceRmlComponent.h b/source/juceRmlUi/juceRmlComponent.h
+index 75992cba..a59c78b5 100644
+--- a/source/juceRmlUi/juceRmlComponent.h
++++ b/source/juceRmlUi/juceRmlComponent.h
+@@ -5,6 +5,7 @@
+ #include "juceRmlDrag.h"
+ #include "rmlInterfaces.h"
+ #include "rmlRendererProxy.h"
++#include "rmlTouchRouter.h"
+ #include "baseLib/event.h"
+ 
+ #include "juce_gui_basics/juce_gui_basics.h"
+@@ -149,6 +150,10 @@ namespace juceRmlUi
+ 		void paint(juce::Graphics& _g) override;
+ 
+ 		Component* getComponentAt(juce::Point<float> _position) override;
++
++		const TouchRouter& getTouchRouter() const { return m_touchRouter; }
++		// Releases every finger currently held on the panel, e.g. when the view goes away.
++		void cancelTouches();
+ 		Rml::Element* getLastElementByGetComponentAt() const { return m_lastGetComponentAt.get(); }
+ 
+ 	private:
+@@ -167,6 +172,8 @@ namespace juceRmlUi
+ 
+ 		Rml::Vector2i getRenderSize() const;
+ 
++		static bool isTouch(const juce::MouseEvent& _event);
++
+ 		int toRmlModifiers(const juce::MouseEvent& _event);
+ 		int toRmlModifiers(const juce::KeyPress& _event);
+ 		int toRmlModifiers(const juce::ModifierKeys& _mods);
+@@ -191,6 +198,8 @@ namespace juceRmlUi
+ 		Rml::Context* m_rmlContext = nullptr;
+ 		Rml::ElementDocument* m_document = nullptr;
+ 
++		TouchRouter m_touchRouter;
++
+ 		std::vector<juce::KeyPress> m_pressedKeys;
+ 		float m_contentScale = 1.0f;
+ 		float m_currentRenderScale = 0.0f;
+diff --git a/source/juceRmlUi/rmlElemKnob.cpp b/source/juceRmlUi/rmlElemKnob.cpp
+index ac8e81ea..05d8bafd 100644
+--- a/source/juceRmlUi/rmlElemKnob.cpp
++++ b/source/juceRmlUi/rmlElemKnob.cpp
+@@ -1,6 +1,7 @@
+ #include "rmlElemKnob.h"
+ 
+ #include "rmlHelper.h"
++#include "rmlTouchRouter.h"
+ 
+ #include <cmath>
+ 
+@@ -8,6 +9,9 @@ namespace juceRmlUi
+ {
+ 	ElemKnob::ElemKnob(Rml::CoreInstance& _coreInstance, const Rml::String& _tag): ElemValue(_coreInstance, _tag)
+ 	{
++		// Each finger turns its own knob; see TouchRouter.
++		TouchRouter::setTouchCapture(this);
++
+ 		AddEventListener(Rml::EventId::Mousedown, this);
+ 		AddEventListener(Rml::EventId::Drag, this);
+ 		AddEventListener(Rml::EventId::Mousescroll, this);
+diff --git a/source/juceRmlUi/rmlElemKnob.h b/source/juceRmlUi/rmlElemKnob.h
+index 67d2bf53..0389ab27 100644
+--- a/source/juceRmlUi/rmlElemKnob.h
++++ b/source/juceRmlUi/rmlElemKnob.h
+@@ -20,6 +20,7 @@ namespace juceRmlUi
+ 		void ProcessEvent(Rml::Event& _event) override;
+ 
+ 		void setEndless(bool _endless);
++		float remoteDragValueDelta(float dx, float dy) const { return (dx - dy) * getRange() / m_speed; }
+ 
+ 		static bool isReversed(const Rml::Element* _element);
+ 		static float mouseWheelValueDelta(float _range, const Rml::Event& _event,
+diff --git a/source/synthLib/CMakeLists.txt b/source/synthLib/CMakeLists.txt
+index a65721b6..e666bf29 100644
+--- a/source/synthLib/CMakeLists.txt
++++ b/source/synthLib/CMakeLists.txt
+@@ -27,6 +27,7 @@ set(SOURCES
+ 	os.cpp os.h
+ 	plugin.cpp plugin.h
+ 	realtimeInstrumentation.cpp realtimeInstrumentation.h
++	callbackCapture.cpp callbackCapture.h
+ 	performanceReport.cpp performanceReport.h
+ 	mameResamplers.cpp mameResamplers.h
+ 	resampler.cpp resampler.h

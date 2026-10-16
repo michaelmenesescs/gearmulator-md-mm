@@ -1,0 +1,2 @@
+PASS receiver: synthetic PNG reassembly/decoding, geometry transform, stale-generation discard, source-loss blanking, missing-chunk rejection
+Synthetic fixture only; no live panel pixels or runtime acceptance evidence.

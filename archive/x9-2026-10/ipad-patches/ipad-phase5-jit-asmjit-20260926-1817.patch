@@ -1,0 +1,73 @@
+diff --git a/src/asmjit/core/virtmem.cpp b/src/asmjit/core/virtmem.cpp
+index 2d16b66..15e663a 100644
+--- a/src/asmjit/core/virtmem.cpp
++++ b/src/asmjit/core/virtmem.cpp
+@@ -29,6 +29,9 @@
+     #include <pthread.h>
+     #include <TargetConditionals.h>
+     #include <libkern/OSCacheControl.h> // sys_icache_invalidate(), available on iOS too.
++    #if TARGET_OS_IPHONE
++      #include <mach/mach.h>
++    #endif
+     #if TARGET_OS_OSX
+       #include <sys/utsname.h>
+     #endif
+@@ -505,6 +508,10 @@ static bool hasHardenedRuntime() noexcept {
+ #if defined(__APPLE__) && TARGET_OS_OSX && ASMJIT_ARCH_ARM >= 64
+   // OSX on AArch64 has always hardened runtime enabled.
+   return true;
++#elif defined(__APPLE__) && TARGET_OS_IPHONE
++  // iOS accepts an RWX mmap() but silently drops execute permission (verified on iPadOS 18.7.8 / A10: executing
++  // such a page faults with KERN_PROTECTION_FAILURE), so the probe below would wrongly report "not hardened".
++  return true;
+ #else
+   static std::atomic<uint32_t> globalHardenedFlag;
+ 
+@@ -707,6 +714,35 @@ static Error allocDualMappingUsingRemapdup(DualMapping* dmOut, size_t size, Memo
+ }
+ #endif
+ 
++#if defined(__APPLE__) && TARGET_OS_IPHONE
++// iOS: RW anonymous memory plus a vm_remap() mirror of the same pages that is switched to RX. Executing the mirror
++// requires the process to be CS_DEBUGGED (a debugger attached at least once); otherwise the kernel kills it.
++static Error allocDualMappingUsingVmRemap(DualMapping* dmOut, size_t size) noexcept {
++  vm_address_t rw = 0;
++  if (vm_allocate(mach_task_self(), &rw, size, VM_FLAGS_ANYWHERE) != KERN_SUCCESS)
++    return DebugUtils::errored(kErrorOutOfMemory);
++
++  vm_address_t rx = 0;
++  vm_prot_t curProt = 0, maxProt = 0;
++  if (vm_remap(mach_task_self(), &rx, size, 0, VM_FLAGS_ANYWHERE, mach_task_self(), rw, FALSE,
++               &curProt, &maxProt, VM_INHERIT_NONE) != KERN_SUCCESS) {
++    vm_deallocate(mach_task_self(), rw, size);
++    return DebugUtils::errored(kErrorOutOfMemory);
++  }
++
++  if (mprotect(reinterpret_cast<void*>(rx), size, PROT_READ | PROT_EXEC) != 0) {
++    int e = errno;
++    vm_deallocate(mach_task_self(), rx, size);
++    vm_deallocate(mach_task_self(), rw, size);
++    return DebugUtils::errored(asmjitErrorFromErrno(e));
++  }
++
++  dmOut->rx = reinterpret_cast<void*>(rx);
++  dmOut->rw = reinterpret_cast<void*>(rw);
++  return kErrorOk;
++}
++#endif
++
+ Error allocDualMapping(DualMapping* dm, size_t size, MemoryFlags memoryFlags) noexcept {
+   dm->rx = nullptr;
+   dm->rw = nullptr;
+@@ -714,7 +750,10 @@ Error allocDualMapping(DualMapping* dm, size_t size, MemoryFlags memoryFlags) no
+   if (off_t(size) <= 0)
+     return DebugUtils::errored(size == 0 ? kErrorInvalidArgument : kErrorTooLarge);
+ 
+-#if defined(ASMJIT_ANONYMOUS_MEMORY_USE_REMAPDUP)
++#if defined(__APPLE__) && TARGET_OS_IPHONE
++  DebugUtils::unused(memoryFlags);
++  return allocDualMappingUsingVmRemap(dm, size);
++#elif defined(ASMJIT_ANONYMOUS_MEMORY_USE_REMAPDUP)
+   return allocDualMappingUsingRemapdup(dm, size, memoryFlags);
+ #elif defined(ASMJIT_ANONYMOUS_MEMORY_USE_FD)
+   bool preferTmpOverDevShm = Support::test(memoryFlags, MemoryFlags::kMappingPreferTmp);

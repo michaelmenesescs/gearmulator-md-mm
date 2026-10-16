@@ -1,0 +1,14 @@
+Test project /Users/michaelmeneses/gearmulator-md-mm/build/macos-md-arm64
+    Start 21: juceRmlMouseInputTest
+1/3 Test #21: juceRmlMouseInputTest ............   Passed    0.20 sec
+    Start 22: juceRmlTouchRouterTest
+2/3 Test #22: juceRmlTouchRouterTest ...........   Passed    0.20 sec
+    Start 84: mdFrontPanelPresentationTests
+3/3 Test #84: mdFrontPanelPresentationTests ....   Passed    0.01 sec
+
+100% tests passed out of 3
+
+Label Time Summary:
+UnitTest    =   0.01 sec*proc (1 test)
+
+Total Test time (real) =   0.42 sec
